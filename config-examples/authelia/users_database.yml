@@ -1,0 +1,113 @@
+# Authelia Users Database Configuration
+# This file defines users when using the file-based authentication backend
+# For production, use LDAP/Active Directory instead
+
+# Password hashes can be generated using:
+# authelia hash-password 'your-password'
+# Or using argon2: echo 'password' | argon2 somesalt -e
+
+users:
+  # Administrator account
+  admin:
+    displayname: "System Administrator"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: admin@company.com
+    groups:
+      - admins
+      - users
+      - vpn-users
+
+  # Security team member
+  security.analyst:
+    displayname: "Security Analyst"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: security@company.com
+    groups:
+      - security
+      - users
+      - vpn-users
+
+  # Standard employee
+  john.doe:
+    displayname: "John Doe"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: john.doe@company.com
+    groups:
+      - employees
+      - users
+      - vpn-users
+
+  # IT support staff
+  it.support:
+    displayname: "IT Support"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: support@company.com
+    groups:
+      - it-support
+      - users
+      - vpn-users
+
+  # Contractor account (limited access)
+  contractor.smith:
+    displayname: "Jane Smith (Contractor)"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: jane.smith@contractor.com
+    groups:
+      - contractors
+      - vpn-users
+
+  # Remote worker
+  remote.worker:
+    displayname: "Remote Worker"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: remote@company.com
+    groups:
+      - remote-workers
+      - employees
+      - users
+      - vpn-users
+
+  # Guest account (very limited access)
+  guest.user:
+    displayname: "Guest User"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$iWh06vD8Fy27wf9npn6FXBiQjy0mHbZzfeFiOLbZAyU"  # changeme123
+    email: guest@company.com
+    groups:
+      - guests
+
+# Group definitions for reference
+# These groups are used in access control rules
+
+# Group hierarchy:
+# - admins: Full system access
+# - security: Security monitoring and incident response
+# - it-support: Technical support and troubleshooting
+# - employees: Standard company employees
+# - remote-workers: Employees working remotely
+# - contractors: External contractors with limited access
+# - guests: Temporary access users
+# - users: Base group for authenticated users
+# - vpn-users: Users allowed to use VPN
+
+# Password policy recommendations:
+# - Minimum 12 characters
+# - Mix of uppercase, lowercase, numbers, and symbols
+# - No common dictionary words
+# - Regular password rotation (90 days)
+# - No password reuse (last 12 passwords)
+
+# Security notes:
+# 1. Change all default passwords immediately
+# 2. Use strong, unique passwords for each account
+# 3. Enable 2FA for all accounts
+# 4. Regularly audit user accounts and permissions
+# 5. Remove unused accounts promptly
+# 6. Monitor authentication logs for suspicious activity
+
+# For production environments:
+# - Use LDAP/Active Directory instead of file-based authentication
+# - Implement password complexity policies
+# - Enable account lockout policies
+# - Use centralized identity management
+# - Implement privileged access management (PAM)
+# - Regular access reviews and certifications

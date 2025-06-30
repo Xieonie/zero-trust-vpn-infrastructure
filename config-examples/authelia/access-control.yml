@@ -1,0 +1,374 @@
+# Authelia Access Control Configuration
+# This file defines granular access control policies for Zero Trust VPN
+
+# Default policy - deny all access unless explicitly allowed
+default_policy: deny
+
+# Network definitions for easier rule management
+networks:
+  - name: internal
+    networks:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+  
+  - name: vpn
+    networks:
+      - 10.8.0.0/24
+  
+  - name: management
+    networks:
+      - 192.168.10.0/24
+  
+  - name: dmz
+    networks:
+      - 192.168.100.0/24
+
+# Access control rules (processed in order)
+rules:
+  # Emergency access for administrators
+  - domain: "emergency.company.com"
+    policy: two_factor
+    subject: "group:admins"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/emergency/.*$"
+
+  # VPN management interface - admin only
+  - domain: "vpn-admin.company.com"
+    policy: two_factor
+    subject: "group:admins"
+    networks:
+      - internal
+      - vpn
+      - management
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+
+  # Security monitoring dashboard
+  - domain: "security.company.com"
+    policy: two_factor
+    subject: 
+      - "group:admins"
+      - "group:security"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+
+  # IT support tools
+  - domain: "support.company.com"
+    policy: two_factor
+    subject:
+      - "group:admins"
+      - "group:it-support"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/tickets/.*$"
+      - "^/tools/.*$"
+
+  # Employee self-service portal
+  - domain: "selfservice.company.com"
+    policy: one_factor
+    subject: "group:employees"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/profile/.*$"
+      - "^/password/.*$"
+      - "^/certificates/.*$"
+
+  # File sharing for employees
+  - domain: "files.company.com"
+    policy: one_factor
+    subject:
+      - "group:employees"
+      - "group:remote-workers"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+      - PUT
+    resources:
+      - "^/shared/.*$"
+      - "^/personal/.*$"
+
+  # Development environment - employees only
+  - domain: "dev.company.com"
+    policy: one_factor
+    subject: "group:employees"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+    resources:
+      - "^/api/.*$"
+      - "^/repos/.*$"
+
+  # Contractor access - limited resources
+  - domain: "contractor.company.com"
+    policy: two_factor
+    subject: "group:contractors"
+    networks:
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/project/.*$"
+      - "^/documents/.*$"
+
+  # Remote worker specific resources
+  - domain: "remote.company.com"
+    policy: one_factor
+    subject: "group:remote-workers"
+    networks:
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/workspace/.*$"
+      - "^/collaboration/.*$"
+
+  # Guest access - very limited
+  - domain: "guest.company.com"
+    policy: one_factor
+    subject: "group:guests"
+    networks:
+      - vpn
+    methods:
+      - GET
+    resources:
+      - "^/public/.*$"
+      - "^/welcome/.*$"
+
+  # Time-based access example (business hours only)
+  - domain: "business.company.com"
+    policy: one_factor
+    subject: "group:employees"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+    # Uncomment to enable time-based access
+    # time:
+    #   - "Monday 09:00-17:00"
+    #   - "Tuesday 09:00-17:00"
+    #   - "Wednesday 09:00-17:00"
+    #   - "Thursday 09:00-17:00"
+    #   - "Friday 09:00-17:00"
+
+  # API access with rate limiting
+  - domain: "api.company.com"
+    policy: one_factor
+    subject: "group:users"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+    resources:
+      - "^/api/v1/.*$"
+
+  # Monitoring endpoints - read-only for most users
+  - domain: "monitoring.company.com"
+    policy: one_factor
+    subject: "group:users"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+    resources:
+      - "^/dashboards/.*$"
+      - "^/metrics/.*$"
+
+  # Admin-only monitoring configuration
+  - domain: "monitoring.company.com"
+    policy: two_factor
+    subject: "group:admins"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+    resources:
+      - "^/admin/.*$"
+      - "^/config/.*$"
+
+  # Backup and recovery systems
+  - domain: "backup.company.com"
+    policy: two_factor
+    subject:
+      - "group:admins"
+      - "group:it-support"
+    networks:
+      - internal
+      - management
+    methods:
+      - GET
+      - POST
+
+  # Certificate management
+  - domain: "pki.company.com"
+    policy: two_factor
+    subject: "group:admins"
+    networks:
+      - internal
+      - management
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+
+  # Log analysis and SIEM
+  - domain: "logs.company.com"
+    policy: two_factor
+    subject:
+      - "group:admins"
+      - "group:security"
+    networks:
+      - internal
+      - vpn
+    methods:
+      - GET
+      - POST
+
+  # Network management tools
+  - domain: "network.company.com"
+    policy: two_factor
+    subject:
+      - "group:admins"
+      - "group:it-support"
+    networks:
+      - internal
+      - management
+    methods:
+      - GET
+      - POST
+
+  # User directory management
+  - domain: "directory.company.com"
+    policy: two_factor
+    subject: "group:admins"
+    networks:
+      - internal
+      - management
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+
+# Advanced access control features
+
+# IP-based restrictions (examples)
+# - domain: "sensitive.company.com"
+#   policy: two_factor
+#   subject: "group:admins"
+#   networks:
+#     - internal
+#   methods:
+#     - GET
+#     - POST
+#   # Only allow from specific IP ranges
+#   remote_ip:
+#     - "192.168.10.0/24"
+#     - "10.0.1.0/24"
+
+# Device-based restrictions (requires device certificates)
+# - domain: "device-restricted.company.com"
+#   policy: two_factor
+#   subject: "group:employees"
+#   networks:
+#     - vpn
+#   methods:
+#     - GET
+#   # Require specific device certificates
+#   device_certificates:
+#     - "corporate-laptop"
+#     - "company-phone"
+
+# Geographic restrictions (requires GeoIP)
+# - domain: "geo-restricted.company.com"
+#   policy: one_factor
+#   subject: "group:employees"
+#   networks:
+#     - vpn
+#   methods:
+#     - GET
+#   # Only allow from specific countries
+#   countries:
+#     - "US"
+#     - "CA"
+#     - "GB"
+
+# Session-based restrictions
+# - domain: "session-limited.company.com"
+#   policy: one_factor
+#   subject: "group:contractors"
+#   networks:
+#     - vpn
+#   methods:
+#     - GET
+#   # Limit session duration
+#   session_timeout: "4h"
+#   # Limit concurrent sessions
+#   max_sessions: 1
+
+# Risk-based access control
+# - domain: "risk-based.company.com"
+#   policy: one_factor
+#   subject: "group:users"
+#   networks:
+#     - vpn
+#   methods:
+#     - GET
+#   # Require additional authentication for high-risk scenarios
+#   risk_factors:
+#     - new_device
+#     - unusual_location
+#     - suspicious_behavior
+
+# Notes:
+# 1. Rules are processed in order - first match wins
+# 2. Use specific rules before general ones
+# 3. Always test access control changes in a staging environment
+# 4. Monitor access logs for unauthorized attempts
+# 5. Regularly review and update access control policies
+# 6. Document the business justification for each rule
+# 7. Implement the principle of least privilege
+# 8. Use groups instead of individual users where possible

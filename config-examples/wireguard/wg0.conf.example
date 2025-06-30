@@ -1,0 +1,72 @@
+# WireGuard Server Configuration Example
+# Copy this file to /etc/wireguard/wg0.conf and customize
+
+[Interface]
+# Server private key (generate with: wg genkey)
+PrivateKey = SERVER_PRIVATE_KEY_HERE
+
+# Server IP address within the VPN network
+Address = 10.8.0.1/24
+
+# Port to listen on (default: 51820)
+ListenPort = 51820
+
+# DNS servers for clients (optional)
+DNS = 10.8.0.1, 1.1.1.1
+
+# Post-up script to configure routing and firewall rules
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostUp = ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# Post-down script to clean up routing and firewall rules
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostDown = ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Advanced routing for specific networks
+# PostUp = ip route add 192.168.1.0/24 via 10.8.0.1 dev %i
+# PostDown = ip route del 192.168.1.0/24 via 10.8.0.1 dev %i
+
+# Traffic shaping (optional)
+# PostUp = tc qdisc add dev %i root handle 1: htb default 30
+# PostUp = tc class add dev %i parent 1: classid 1:1 htb rate 100mbit
+# PostDown = tc qdisc del dev %i root
+
+# Logging (optional)
+# PostUp = echo "WireGuard interface %i started at $(date)" >> /var/log/wireguard.log
+# PostDown = echo "WireGuard interface %i stopped at $(date)" >> /var/log/wireguard.log
+
+# Client configurations will be added below
+# Each client gets a [Peer] section
+
+# Example client configuration (uncomment and customize):
+# [Peer]
+# # Client public key
+# PublicKey = CLIENT_PUBLIC_KEY_HERE
+# 
+# # Allowed IPs for this client
+# AllowedIPs = 10.8.0.2/32
+# 
+# # Optional: Persistent keepalive for NAT traversal
+# PersistentKeepalive = 25
+# 
+# # Optional: Endpoint if client has static IP
+# # Endpoint = client.example.com:51820
+
+# Security considerations:
+# 1. Keep private keys secure and never share them
+# 2. Use strong, unique keys for each peer
+# 3. Regularly rotate keys
+# 4. Monitor connection logs
+# 5. Implement proper firewall rules
+# 6. Use certificate-based authentication where possible
+
+# Performance tuning:
+# 1. Adjust MTU if needed (default: 1420)
+# 2. Use persistent keepalive for NAT traversal
+# 3. Consider using multiple interfaces for load balancing
+# 4. Monitor bandwidth usage and adjust limits
+
+# Network topology example:
+# Internet ← → WireGuard Server (10.8.0.1) ← → Internal Network (192.168.1.0/24)
+#                    ↑
+#              VPN Clients (10.8.0.2-254)

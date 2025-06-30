@@ -1,0 +1,303 @@
+version: '3.8'
+
+services:
+  # Authentication Server
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    restart: unless-stopped
+    volumes:
+      - authelia_config:/config
+      - ${CONFIG_PATH}/authelia:/config/custom
+    environment:
+      - TZ=${TZ:-UTC}
+    networks:
+      - vpn-network
+    ports:
+      - "9091:9091"
+    depends_on:
+      - authelia-redis
+      - postgres
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for Authelia sessions
+  authelia-redis:
+    image: redis:alpine
+    container_name: authelia-redis
+    restart: unless-stopped
+    volumes:
+      - authelia_redis_data:/data
+    networks:
+      - vpn-network
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL for Authelia
+  postgres:
+    image: postgres:13
+    container_name: authelia-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - vpn-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # WireGuard Management Interface
+  wg-easy:
+    image: weejewel/wg-easy:latest
+    container_name: wg-easy
+    restart: unless-stopped
+    environment:
+      - WG_HOST=${DOMAIN}
+      - PASSWORD=${WG_EASY_PASSWORD:-admin123}
+      - WG_DEFAULT_ADDRESS=10.10.0.x
+      - WG_DEFAULT_DNS=${DNS_SERVERS}
+      - WG_ALLOWED_IPS=0.0.0.0/0
+      - WG_PERSISTENT_KEEPALIVE=25
+    volumes:
+      - wg_easy_data:/etc/wireguard
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - vpn-network
+    profiles:
+      - wg-easy
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vpn-prometheus
+    restart: unless-stopped
+    volumes:
+      - prometheus_data:/prometheus
+      - ${CONFIG_PATH}/prometheus:/etc/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - vpn-network
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    profiles:
+      - monitoring
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vpn-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://grafana.${DOMAIN}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ${CONFIG_PATH}/grafana:/etc/grafana/provisioning
+    networks:
+      - vpn-network
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+  # Alertmanager for alerts
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: vpn-alertmanager
+    restart: unless-stopped
+    volumes:
+      - alertmanager_data:/alertmanager
+      - ${CONFIG_PATH}/alertmanager:/etc/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=https://alerts.${DOMAIN}'
+    networks:
+      - vpn-network
+    ports:
+      - "9093:9093"
+    profiles:
+      - monitoring
+
+  # Node Exporter for system metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: vpn-node-exporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - vpn-network
+    ports:
+      - "9100:9100"
+    profiles:
+      - monitoring
+
+  # WireGuard Exporter for VPN metrics
+  wireguard-exporter:
+    image: mindflavor/prometheus-wireguard-exporter:latest
+    container_name: wireguard-exporter
+    restart: unless-stopped
+    volumes:
+      - /etc/wireguard:/etc/wireguard:ro
+    command:
+      - '-n'
+      - '/etc/wireguard/wg0.conf'
+    networks:
+      - vpn-network
+    ports:
+      - "9586:9586"
+    profiles:
+      - monitoring
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: vpn-nginx
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_PATH}/nginx:/etc/nginx/conf.d
+      - ${CERTS_PATH}:/etc/ssl/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - vpn-network
+    depends_on:
+      - authelia
+    profiles:
+      - nginx
+
+  # Fail2Ban for intrusion prevention
+  fail2ban:
+    image: crazymax/fail2ban:latest
+    container_name: vpn-fail2ban
+    restart: unless-stopped
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - fail2ban_data:/data
+      - ${CONFIG_PATH}/fail2ban:/etc/fail2ban/custom
+      - ${LOGS_PATH}:/var/log/vpn:ro
+    environment:
+      - TZ=${TZ:-UTC}
+      - F2B_LOG_LEVEL=INFO
+      - F2B_DB_PURGE_AGE=30d
+    profiles:
+      - security
+
+  # Log aggregation with Loki
+  loki:
+    image: grafana/loki:latest
+    container_name: vpn-loki
+    restart: unless-stopped
+    volumes:
+      - loki_data:/loki
+      - ${CONFIG_PATH}/loki:/etc/loki
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - vpn-network
+    ports:
+      - "3100:3100"
+    profiles:
+      - logging
+
+  # Log collection with Promtail
+  promtail:
+    image: grafana/promtail:latest
+    container_name: vpn-promtail
+    restart: unless-stopped
+    volumes:
+      - ${LOGS_PATH}:/var/log/vpn:ro
+      - ${CONFIG_PATH}/promtail:/etc/promtail
+    command: -config.file=/etc/promtail/promtail.yml
+    networks:
+      - vpn-network
+    depends_on:
+      - loki
+    profiles:
+      - logging
+
+  # Backup service
+  backup:
+    image: alpine:latest
+    container_name: vpn-backup
+    restart: "no"
+    volumes:
+      - ${CONFIG_PATH}:/data/config:ro
+      - ${CERTS_PATH}:/data/certs:ro
+      - backup_data:/backup
+      - ./scripts/backup:/scripts:ro
+    command: /scripts/backup.sh
+    networks:
+      - vpn-network
+    profiles:
+      - backup
+
+networks:
+  vpn-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  authelia_config:
+    driver: local
+  authelia_redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  wg_easy_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+  fail2ban_data:
+    driver: local
+  loki_data:
+    driver: local
+  backup_data:
+    driver: local

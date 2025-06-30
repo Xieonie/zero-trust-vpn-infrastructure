@@ -1,0 +1,327 @@
+# Authelia Configuration for Zero Trust VPN
+# This configuration provides comprehensive authentication and authorization
+
+###############################################################
+#                   Authelia Configuration                   #
+###############################################################
+
+# Server Configuration
+server:
+  host: 0.0.0.0
+  port: 9091
+  path: ""
+  read_buffer_size: 4096
+  write_buffer_size: 4096
+  enable_pprof: false
+  enable_expvars: false
+  disable_healthcheck: false
+  tls:
+    key: ""
+    certificate: ""
+
+# Logging Configuration
+log:
+  level: info
+  format: text
+  file_path: ""
+  keep_stdout: true
+
+# Theme Configuration
+theme: light
+
+# JWT Secret for session tokens
+jwt_secret: ${AUTHELIA_JWT_SECRET}
+
+# Default redirection URL
+default_redirection_url: https://auth.yourdomain.com
+
+# TOTP Configuration
+totp:
+  issuer: authelia.com
+  algorithm: sha1
+  digits: 6
+  period: 30
+  skew: 1
+  secret_size: 32
+
+# WebAuthn Configuration (FIDO2)
+webauthn:
+  timeout: 60s
+  display_name: Authelia
+  attestation_conveyance_preference: indirect
+  user_verification: preferred
+  rp_id: yourdomain.com
+  rp_origins:
+    - https://auth.yourdomain.com
+  rp_icon: https://auth.yourdomain.com/icon.png
+
+# Duo Push API Configuration (optional)
+# duo_api:
+#   hostname: api-123456789.duosecurity.com
+#   integration_key: ABCDEF
+#   secret_key: ${DUO_SECRET_KEY}
+
+# Authentication Backend
+authentication_backend:
+  password_reset:
+    disable: false
+  refresh_interval: 5m
+  
+  # LDAP Backend Configuration
+  ldap:
+    implementation: custom
+    url: ${LDAP_URL}
+    timeout: 5s
+    start_tls: false
+    tls:
+      skip_verify: false
+      minimum_version: TLS1.2
+    base_dn: ${LDAP_BASE_DN}
+    username_attribute: uid
+    additional_users_dn: ou=users
+    users_filter: (&({username_attribute}={input})(objectClass=person))
+    additional_groups_dn: ou=groups
+    groups_filter: (&(member={dn})(objectClass=groupOfNames))
+    group_name_attribute: cn
+    mail_attribute: mail
+    display_name_attribute: displayName
+    user: ${LDAP_USER}
+    password: ${LDAP_PASSWORD}
+
+  # Alternative: File-based backend for testing
+  # file:
+  #   path: /config/users_database.yml
+  #   password:
+  #     algorithm: argon2id
+  #     iterations: 1
+  #     salt_length: 16
+  #     parallelism: 8
+  #     memory: 64
+
+# Access Control Configuration
+access_control:
+  default_policy: deny
+  networks:
+    - name: internal
+      networks:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    - name: vpn
+      networks:
+        - 10.8.0.0/24
+  
+  rules:
+    # VPN Access - Requires two-factor authentication
+    - domain: "vpn.yourdomain.com"
+      policy: two_factor
+      networks:
+        - internal
+        - vpn
+      
+    # Admin Panel - Restricted to administrators with two-factor
+    - domain: "admin.yourdomain.com"
+      policy: two_factor
+      subject: "group:administrators"
+      networks:
+        - internal
+        - vpn
+      
+    # Monitoring - Restricted to monitoring group
+    - domain: "monitoring.yourdomain.com"
+      policy: two_factor
+      subject: 
+        - "group:administrators"
+        - "group:monitoring"
+      networks:
+        - internal
+        - vpn
+    
+    # Public services - Single factor authentication
+    - domain: "public.yourdomain.com"
+      policy: one_factor
+      networks:
+        - internal
+        - vpn
+    
+    # Development environment - Bypass for internal networks
+    - domain: "dev.yourdomain.com"
+      policy: bypass
+      networks:
+        - internal
+      
+    # Time-based access example
+    - domain: "business.yourdomain.com"
+      policy: two_factor
+      subject: "group:employees"
+      networks:
+        - internal
+        - vpn
+      # Only allow access during business hours
+      # time:
+      #   - "Monday 09:00-17:00"
+      #   - "Tuesday 09:00-17:00"
+      #   - "Wednesday 09:00-17:00"
+      #   - "Thursday 09:00-17:00"
+      #   - "Friday 09:00-17:00"
+
+# Session Configuration
+session:
+  name: authelia_session
+  domain: yourdomain.com
+  secret: ${AUTHELIA_SESSION_SECRET}
+  expiration: 1h
+  inactivity: 5m
+  remember_me_duration: 1M
+  
+  # Redis session storage
+  redis:
+    host: redis
+    port: 6379
+    password: ${REDIS_PASSWORD}
+    database_index: 0
+    maximum_active_connections: 8
+    minimum_idle_connections: 0
+    
+  # Alternative: In-memory session storage (not recommended for production)
+  # provider: memory
+
+# Regulation Configuration (Brute Force Protection)
+regulation:
+  max_retries: 3
+  find_time: 2m
+  ban_time: 5m
+
+# Storage Configuration
+storage:
+  encryption_key: ${AUTHELIA_STORAGE_ENCRYPTION_KEY}
+  
+  # PostgreSQL storage
+  postgres:
+    host: postgres
+    port: 5432
+    database: ${POSTGRES_DB}
+    schema: public
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+    timeout: 5s
+    
+  # Alternative: MySQL storage
+  # mysql:
+  #   host: mysql
+  #   port: 3306
+  #   database: authelia
+  #   username: authelia
+  #   password: ${MYSQL_PASSWORD}
+  
+  # Alternative: SQLite storage (not recommended for production)
+  # local:
+  #   path: /config/db.sqlite3
+
+# Notification Configuration
+notifier:
+  disable_startup_check: false
+  
+  # SMTP Configuration
+  smtp:
+    username: ${SMTP_USERNAME}
+    password: ${SMTP_PASSWORD}
+    host: ${SMTP_HOST}
+    port: 587
+    sender: "Authelia <noreply@yourdomain.com>"
+    identifier: localhost
+    subject: "[Authelia] {title}"
+    startup_check_address: test@authelia.com
+    disable_require_tls: false
+    disable_html_emails: false
+    tls:
+      skip_verify: false
+      minimum_version: TLS1.2
+      
+  # Alternative: File-based notifications for testing
+  # filesystem:
+  #   filename: /config/notification.txt
+
+# Identity Providers Configuration (optional)
+# identity_providers:
+#   oidc:
+#     hmac_secret: ${AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET}
+#     issuer_private_key: |
+#       -----BEGIN RSA PRIVATE KEY-----
+#       ...
+#       -----END RSA PRIVATE KEY-----
+#     access_token_lifespan: 1h
+#     authorize_code_lifespan: 1m
+#     id_token_lifespan: 1h
+#     refresh_token_lifespan: 90m
+#     enable_client_debug_messages: false
+#     clients:
+#       - id: myapp
+#         description: My Application
+#         secret: ${OIDC_CLIENT_SECRET}
+#         public: false
+#         authorization_policy: two_factor
+#         redirect_uris:
+#           - https://myapp.yourdomain.com/oauth2/callback
+#         scopes:
+#           - openid
+#           - profile
+#           - email
+#           - groups
+#         userinfo_signing_algorithm: none
+
+# Password Policy Configuration
+password_policy:
+  standard:
+    enabled: true
+    min_length: 8
+    max_length: 0
+    require_uppercase: true
+    require_lowercase: true
+    require_number: true
+    require_special: true
+  zxcvbn:
+    enabled: false
+    min_score: 3
+
+# Privacy Policy Configuration
+privacy_policy:
+  enabled: false
+  require_user_acceptance: false
+  policy_url: ""
+
+# NTP Configuration
+ntp:
+  address: "time.cloudflare.com:123"
+  version: 4
+  max_desync: 3s
+  disable_startup_check: false
+  disable_failure: false
+
+# Telemetry Configuration
+telemetry:
+  metrics:
+    enabled: false
+    address: "tcp://0.0.0.0:9959"
+    buffers:
+      read: 4096
+      write: 4096
+    timeouts:
+      read: 6s
+      write: 6s
+      idle: 30s
+
+# Additional Security Headers
+# These can be configured in your reverse proxy as well
+# headers:
+#   csp_template: |
+#     default-src 'self';
+#     object-src 'none';
+#     style-src 'self' 'unsafe-inline';
+#     script-src 'self';
+#     img-src 'self' data:;
+#     font-src 'self';
+#     connect-src 'self';
+#     frame-ancestors 'none';
+#     base-uri 'self';
+#     form-action 'self';
