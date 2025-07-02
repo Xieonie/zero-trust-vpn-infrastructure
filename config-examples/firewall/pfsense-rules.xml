@@ -1,0 +1,175 @@
+<?xml version="1.0"?>
+<pfsense>
+  <version>2.7.0</version>
+  <lastchange></lastchange>
+  <system>
+    <optimization>normal</optimization>
+    <hostname>pfsense-zt</hostname>
+    <domain>local</domain>
+  </system>
+  
+  <!-- Zero Trust VPN Firewall Rules for pfSense -->
+  <filter>
+    <rule>
+      <id>1</id>
+      <tracker>1</tracker>
+      <type>pass</type>
+      <interface>wan</interface>
+      <ipprotocol>inet</ipprotocol>
+      <tag></tag>
+      <tagged></tagged>
+      <max></max>
+      <max-src-nodes></max-src-nodes>
+      <max-src-conn></max-src-conn>
+      <max-src-states></max-src-states>
+      <statetimeout></statetimeout>
+      <statetype>keep state</statetype>
+      <os></os>
+      <protocol>udp</protocol>
+      <source>
+        <any></any>
+      </source>
+      <destination>
+        <network>wanip</network>
+        <port>51820</port>
+      </destination>
+      <descr>Allow WireGuard VPN traffic on port 51820</descr>
+    </rule>
+    
+    <rule>
+      <id>2</id>
+      <tracker>2</tracker>
+      <type>pass</type>
+      <interface>wireguard</interface>
+      <ipprotocol>inet</ipprotocol>
+      <tag></tag>
+      <tagged></tagged>
+      <max></max>
+      <max-src-nodes></max-src-nodes>
+      <max-src-conn></max-src-conn>
+      <max-src-states></max-src-states>
+      <statetimeout></statetimeout>
+      <statetype>keep state</statetype>
+      <os></os>
+      <protocol>tcp</protocol>
+      <source>
+        <network>wireguard</network>
+      </source>
+      <destination>
+        <address>10.0.1.100</address>
+        <port>9091</port>
+      </destination>
+      <descr>Allow authenticated VPN users to access Authelia</descr>
+    </rule>
+    
+    <rule>
+      <id>3</id>
+      <tracker>3</tracker>
+      <type>block</type>
+      <interface>wireguard</interface>
+      <ipprotocol>inet</ipprotocol>
+      <tag></tag>
+      <tagged></tagged>
+      <max></max>
+      <max-src-nodes></max-src-nodes>
+      <max-src-conn></max-src-conn>
+      <max-src-states></max-src-states>
+      <statetimeout></statetimeout>
+      <statetype>keep state</statetype>
+      <os></os>
+      <protocol>any</protocol>
+      <source>
+        <network>wireguard</network>
+      </source>
+      <destination>
+        <network>lan</network>
+      </destination>
+      <descr>Block direct access to LAN from VPN (Zero Trust)</descr>
+    </rule>
+    
+    <rule>
+      <id>4</id>
+      <tracker>4</tracker>
+      <type>pass</type>
+      <interface>wireguard</interface>
+      <ipprotocol>inet</ipprotocol>
+      <tag></tag>
+      <tagged></tagged>
+      <max></max>
+      <max-src-nodes></max-src-nodes>
+      <max-src-conn></max-src-conn>
+      <max-src-states></max-src-states>
+      <statetimeout></statetimeout>
+      <statetype>keep state</statetype>
+      <os></os>
+      <protocol>tcp</protocol>
+      <source>
+        <network>wireguard</network>
+      </source>
+      <destination>
+        <address>10.0.1.0/24</address>
+        <port>443</port>
+      </destination>
+      <descr>Allow HTTPS to internal services via reverse proxy</descr>
+    </rule>
+    
+    <rule>
+      <id>5</id>
+      <tracker>5</tracker>
+      <type>pass</type>
+      <interface>wireguard</interface>
+      <ipprotocol>inet</ipprotocol>
+      <tag></tag>
+      <tagged></tagged>
+      <max></max>
+      <max-src-nodes></max-src-nodes>
+      <max-src-conn></max-src-conn>
+      <max-src-states></max-src-states>
+      <statetimeout></statetimeout>
+      <statetype>keep state</statetype>
+      <os></os>
+      <protocol>udp</protocol>
+      <source>
+        <network>wireguard</network>
+      </source>
+      <destination>
+        <address>1.1.1.1</address>
+        <port>53</port>
+      </destination>
+      <descr>Allow DNS queries to Cloudflare</descr>
+    </rule>
+  </filter>
+  
+  <!-- NAT Rules -->
+  <nat>
+    <rule>
+      <id>1</id>
+      <tracker>1</tracker>
+      <interface>wan</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>udp</protocol>
+      <source>
+        <any></any>
+      </source>
+      <destination>
+        <network>wanip</network>
+        <port>51820</port>
+      </destination>
+      <target>10.0.2.1</target>
+      <local-port>51820</local-port>
+      <descr>NAT WireGuard traffic to VPN server</descr>
+    </rule>
+  </nat>
+  
+  <!-- Interfaces -->
+  <interfaces>
+    <wireguard>
+      <enable></enable>
+      <if>wg0</if>
+      <descr>WireGuard VPN</descr>
+      <ipaddr>10.0.2.1</ipaddr>
+      <subnet>24</subnet>
+      <gateway></gateway>
+    </wireguard>
+  </interfaces>
+</pfsense>
