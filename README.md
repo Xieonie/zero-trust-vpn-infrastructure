@@ -172,7 +172,7 @@ Internet
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/YOUR_USERNAME/zero-trust-vpn-infrastructure.git
+   git clone https://github.com/Xieonie/zero-trust-vpn-infrastructure.git
    cd zero-trust-vpn-infrastructure
    ```
 
