@@ -1,723 +1,253 @@
-# Troubleshooting Guide
+# Troubleshooting
 
-This guide covers common issues and solutions for the Zero Trust VPN infrastructure.
+Commands assume the default paths and settings (`wg0`, `10.8.0.0/24`,
+`/opt/zero-trust-vpn`). `docker compose` commands are run in
+`/opt/zero-trust-vpn`, where `docker-compose.yml` and `.env` live:
 
-## Table of Contents
-
-1. [General Troubleshooting](#general-troubleshooting)
-2. [WireGuard Issues](#wireguard-issues)
-3. [Authentication Problems](#authentication-problems)
-4. [Certificate Issues](#certificate-issues)
-5. [Network Connectivity](#network-connectivity)
-6. [Performance Problems](#performance-problems)
-7. [Policy Issues](#policy-issues)
-8. [Monitoring and Logging](#monitoring-and-logging)
-
-## General Troubleshooting
-
-### Basic Diagnostic Steps
-
-1. **Check Service Status**
-   ```bash
-   # Check WireGuard status
-   sudo systemctl status wg-quick@wg0
-   
-   # Check Authelia status
-   sudo systemctl status authelia
-   
-   # Check Docker containers
-   docker ps -a
-   docker-compose ps
-   ```
-
-2. **Check Network Connectivity**
-   ```bash
-   # Test internet connectivity
-   ping 8.8.8.8
-   
-   # Test DNS resolution
-   nslookup google.com
-   
-   # Check listening ports
-   netstat -tlnp | grep -E "(51820|9091)"
-   ```
-
-3. **Check Logs**
-   ```bash
-   # WireGuard logs
-   sudo journalctl -u wg-quick@wg0 -f
-   
-   # Authelia logs
-   sudo journalctl -u authelia -f
-   
-   # Docker logs
-   docker logs wireguard
-   docker logs authelia
-   ```
-
-## WireGuard Issues
-
-### Connection Problems
-
-#### Client Cannot Connect
-
-**Symptoms:**
-- Connection timeout
-- Handshake failures
-- No response from server
-
-**Diagnosis:**
-```bash
-# Check WireGuard interface
-sudo wg show
-
-# Check if interface is up
-ip addr show wg0
-
-# Check firewall rules
-sudo iptables -L -n | grep 51820
-
-# Test UDP connectivity
-nc -u server_ip 51820
+```sh
+cd /opt/zero-trust-vpn
 ```
 
-**Solutions:**
+First stop for most problems:
 
-1. **Firewall Issues**
-   ```bash
-   # Allow WireGuard port
-   sudo ufw allow 51820/udp
-   
-   # Check iptables rules
-   sudo iptables -I INPUT -p udp --dport 51820 -j ACCEPT
-   ```
-
-2. **Configuration Issues**
-   ```bash
-   # Verify server configuration
-   sudo cat /etc/wireguard/wg0.conf
-   
-   # Check for syntax errors
-   sudo wg-quick down wg0
-   sudo wg-quick up wg0
-   ```
-
-3. **Key Mismatch**
-   ```bash
-   # Regenerate keys if needed
-   wg genkey | tee private.key | wg pubkey > public.key
-   
-   # Update configuration with new keys
-   sudo nano /etc/wireguard/wg0.conf
-   ```
-
-#### Handshake Failures
-
-**Symptoms:**
-- "Handshake did not complete" errors
-- Connection established but no data transfer
-
-**Diagnosis:**
-```bash
-# Check handshake status
-sudo wg show wg0 latest-handshakes
-
-# Monitor handshake attempts
-sudo wg show wg0 dump
+```sh
+scripts/monitoring/security-audit.sh --verbose
+scripts/monitoring/connection-monitor.sh
 ```
 
-**Solutions:**
+Script logs are in `/var/log/zero-trust-vpn/` (`initial-setup.log`,
+`pki-setup.log`, `firewall-setup.log`, `wireguard-setup.log`,
+`authelia-setup.log`, `cert-renewal.log`, `threat-response.log`,
+`user-sync.log`, `audit.log`, `alerts.log`).
 
-1. **Time Synchronization**
-   ```bash
-   # Check system time
-   timedatectl status
-   
-   # Sync time if needed
-   sudo ntpdate -s time.nist.gov
-   ```
+## Scripts refuse to start
 
-2. **MTU Issues**
-   ```bash
-   # Test different MTU sizes
-   ping -M do -s 1472 destination_ip
-   
-   # Adjust MTU in WireGuard config
-   MTU = 1420
-   ```
+**"Refusing to load /etc/zero-trust-vpn/ztvpn.conf: owned by uid ..." or
+"group/world writable"**: the config ends up in commands run as root, so it
+must be root-owned and not writable by others.
 
-3. **NAT/Firewall Issues**
-   ```bash
-   # Enable IP forwarding
-   echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
-   
-   # Add NAT rules
-   sudo iptables -t nat -A POSTROUTING -s 10.100.0.0/24 -o eth0 -j MASQUERADE
-   ```
-
-### Performance Issues
-
-#### Slow Connection Speeds
-
-**Diagnosis:**
-```bash
-# Test bandwidth
-speedtest-cli
-
-# Check CPU usage
-top -p $(pgrep wg)
-
-# Monitor network interface
-iftop -i wg0
+```sh
+chown root:root /etc/zero-trust-vpn/ztvpn.conf
+chmod 600 /etc/zero-trust-vpn/ztvpn.conf
 ```
 
-**Solutions:**
+**"Ignoring malformed line"**: only `KEY=VALUE` lines (optionally prefixed
+with `export`) and comments are allowed; keys are upper case. Values are
+never expanded, so `$(...)` or `${VAR}` are taken literally.
 
-1. **Optimize Configuration**
-   ```ini
-   # In wg0.conf
-   MTU = 1420
-   PersistentKeepalive = 25
-   ```
+**"example.com is a placeholder"** from `initial-setup.sh`: set `DOMAIN`,
+`AUTH_DOMAIN`, `VPN_ENDPOINT` and `PKI_SERVER_SANS` to your names.
 
-2. **Server Optimization**
-   ```bash
-   # Increase network buffers
-   echo 'net.core.rmem_max = 134217728' >> /etc/sysctl.conf
-   echo 'net.core.wmem_max = 134217728' >> /etc/sysctl.conf
-   sudo sysctl -p
-   ```
+**"yq (mikefarah v4) is required" / "Found a yq that is not mikefarah/yq
+v4"**: the Debian/Ubuntu `yq` package is a different tool. Install
+mikefarah/yq v4 (`initial-setup.sh` does this without `--skip-packages`)
+and make sure it comes first in `PATH`: `yq --version`.
 
-## Authentication Problems
+**"Could not acquire lock ..."**: another script holds the lock in
+`/var/lib/zero-trust-vpn/locks/` for more than 60 seconds. Check for a
+running script (`ps aux | grep scripts/`) before doing anything else.
 
-### Authelia Login Issues
+## Client cannot connect (no handshake)
 
-#### Cannot Access Login Page
-
-**Symptoms:**
-- 502 Bad Gateway
-- Connection refused
-- Timeout errors
-
-**Diagnosis:**
-```bash
-# Check Authelia service
-sudo systemctl status authelia
-
-# Check configuration
-authelia validate-config /etc/authelia/configuration.yml
-
-# Test local connectivity
-curl -I http://localhost:9091
+```sh
+wg show wg0
+systemctl status wg-quick@wg0
+journalctl -u wg-quick@wg0 --since "1 hour ago"
+grep -n -A5 "BEGIN PEER alice--laptop" /etc/wireguard/wg0.conf
+nft list chain inet ztvpn input
 ```
 
-**Solutions:**
+- `latest handshake` missing for the peer: check that UDP `WG_PORT` (51820)
+  reaches the host (cloud security groups, upstream firewalls) and that the
+  client's `Endpoint` is `VPN_ENDPOINT:WG_PORT`.
+- The peer's `public key` in `wg show wg0` must match
+  `/opt/zero-trust-vpn/wireguard/clients/<peer>/public.key`, and the
+  client's `PublicKey` must match `/etc/wireguard/server_public.key`. After
+  `wireguard-setup.sh --force` (new server key) every client config has to
+  be re-issued.
+- Peer present in `wg0.conf` but not on the interface: apply the file
+  without dropping sessions with
+  `wg syncconf wg0 <(wg-quick strip wg0)` or `systemctl reload wg-quick@wg0`.
+- The address may be blocked or quarantined:
 
-1. **Service Issues**
-   ```bash
-   # Restart Authelia
-   sudo systemctl restart authelia
-   
-   # Check for configuration errors
-   sudo journalctl -u authelia --no-pager
+  ```sh
+  nft list set inet ztvpn blocklist4
+  nft list set inet ztvpn quarantine4
+  scripts/automation/threat-response.sh unblock --ip 203.0.113.7
+  ```
+
+- The peer may have been revoked or quarantined:
+  `scripts/management/device-enrollment.sh show --user alice --device laptop`,
+  `ls /var/lib/zero-trust-vpn/quarantine/`, and
+  `grep alice /var/log/zero-trust-vpn/audit.log`.
+
+## Handshake works, but the portal or apps do not load
+
+Work through the path from the client:
+
+1. **Name resolution.** On the client, `AUTH_DOMAIN` and the app names must
+   resolve to the host's address in `SERVICES_SUBNET` (for example
+   `10.0.1.10`). No resolver is shipped; see
+   [installation](installation.md#1-prerequisites). If you run one on the VPN
+   host, `CLIENT_DNS` and `WG_INPUT_PORTS=53` must be set and the client
+   config re-issued.
+2. **Routing on the client.** The client's `AllowedIPs` must include
+   `SERVICES_SUBNET` (default `10.8.0.0/24, 10.0.1.0/24`).
+3. **Firewall.** Only TCP `SERVICES_PORTS` to `SERVICES_SUBNET` is allowed:
+
+   ```sh
+   nft list chain inet ztvpn wg_input
+   nft list chain inet ztvpn wg_forward
+   ip -4 addr show     # the host needs an address inside SERVICES_SUBNET
+   sysctl net.ipv4.ip_forward
    ```
 
-2. **Database Connection**
-   ```bash
-   # Test database connectivity
-   psql -h localhost -U authelia -d authelia
-   
-   # Check database logs
-   sudo journalctl -u postgresql
+   `firewall-setup.sh --apply` warns when forwarding is off, when there is
+   no local address in `SERVICES_SUBNET`, and when Docker has set the
+   iptables `FORWARD` policy to drop. The last one affects clients reaching
+   other hosts in `SERVICES_SUBNET` or the internet (not the nginx container
+   itself); the fix it suggests is `"ip-forward-no-drop": true` in
+   `/etc/docker/daemon.json` (Docker 28 or later).
+4. **Containers.**
+
+   ```sh
+   docker compose ps
+   docker compose logs --tail 100 nginx
+   docker compose logs --tail 100 authelia
+   docker compose exec nginx nginx -t
    ```
 
-#### Authentication Failures
+   nginx waits for Authelia to be healthy, and Authelia for PostgreSQL and
+   Redis.
+5. **TLS.** A certificate warning means the device does not trust the
+   private CA, or the name is not in the certificate's SANs:
 
-**Symptoms:**
-- "Invalid credentials" errors
-- Users cannot log in with correct passwords
-- 2FA failures
+   ```sh
+   openssl x509 -in /opt/zero-trust-vpn/certificates/server/auth.example.org.crt -noout -subject -ext subjectAltName -enddate
+   ```
 
-**Diagnosis:**
-```bash
-# Check user database
-cat /etc/authelia/users_database.yml
+   Install `/opt/zero-trust-vpn/certificates/ca/ca.crt` on the client. To add
+   names, set `PKI_SERVER_SANS` (for example `*.example.org`), run
+   `scripts/setup/pki-setup.sh` and then `docker compose restart nginx`.
+   A connection reset without any certificate for an unknown host name is
+   intended: nginx rejects the TLS handshake for names it has no server
+   block for.
+6. **403 from nginx** (plain nginx error page, not Authelia): the request did
+   not come from `VPN_SUBNET` (`vpn-only.inc`). This happens when the client
+   reaches the host outside the tunnel (name resolves to a public address,
+   or `AllowedIPs` lacks the subnet) or with `SERVICES_NAT=yes`.
 
-# Verify password hash
-docker run --rm authelia/authelia:latest authelia hash-password 'password'
+## Authelia problems
 
-# Check authentication logs
-grep "authentication failed" /var/log/authelia/authelia.log
+```sh
+docker compose logs --since 15m authelia
+docker compose exec authelia authelia validate-config --config /config/configuration.yml
+scripts/setup/authelia-setup.sh --validate
+scripts/management/policy-update.sh validate
 ```
 
-**Solutions:**
+- **Authelia does not start**: `validate-config` names the offending key.
+  The secret files in `/opt/zero-trust-vpn/authelia/secrets/` must exist
+  (`jwt_secret`, `session_secret`, `storage_encryption_key`,
+  `postgres_password`, `redis_password`); `authelia-setup.sh` creates
+  missing ones. Do not regenerate `postgres_password` or
+  `storage_encryption_key` for an existing database: PostgreSQL keeps the
+  old password in its volume, and Authelia cannot decrypt stored 2FA
+  registrations with a new encryption key.
+- **Access denied (403) after login**: list the rules and the user's groups.
 
-1. **Password Issues**
-   ```bash
-   # Generate new password hash
-   docker run --rm authelia/authelia:latest authelia hash-password 'newpassword'
-   
-   # Update users database
-   sudo nano /etc/authelia/users_database.yml
-   ```
+  ```sh
+  scripts/management/policy-update.sh list-rules
+  yq '.users.alice' /opt/zero-trust-vpn/authelia/users_database.yml
+  ```
 
-2. **2FA Issues**
-   ```bash
-   # Check time synchronization
-   timedatectl status
-   
-   # Reset user 2FA (remove from database)
-   # User will need to re-register 2FA device
-   ```
+  First match wins; no match means deny. Every shipped rule requires the
+  `vpn` network. The user needs one of the groups in `subject`
+  (`selfservice.<DOMAIN>` requires both `users` and `vpn-users`).
+- **Rule change has no effect**: Authelia does not reload
+  `configuration.yml` by itself: `docker compose restart authelia` (or
+  `policy-update.sh ... --restart`). Changes to the users file are picked up
+  automatically.
+- **Login fails for a new user**: check the account is not
+  `disabled: true` and that the password is the one from the onboarding file
+  in `/etc/zero-trust-vpn/secrets/onboarding/`. After 5 failures within
+  5 minutes Authelia bans the user for 30 minutes (`regulation`); the log
+  shows it.
+- **Waiting for the 2FA registration code**: with the file notifier it is in
+  the container: `docker compose exec authelia cat /data/notification.txt`.
+- **Redirect loop or "no session" after login**: `AUTH_DOMAIN` must be a
+  subdomain of `DOMAIN` (the session cookie is set for `DOMAIN`), and the app
+  must be served as `https://<name>.<DOMAIN>`.
 
-### LDAP Integration Issues
+## Firewall
 
-#### LDAP Connection Failures
-
-**Diagnosis:**
-```bash
-# Test LDAP connectivity
-ldapsearch -x -H ldap://ldap.server.com -D "cn=user,dc=domain,dc=com" -W
-
-# Check LDAP configuration in Authelia
-grep -A 20 "ldap:" /etc/authelia/configuration.yml
+```sh
+nft list table inet ztvpn
+scripts/setup/firewall-setup.sh --print | diff - /etc/nftables.d/ztvpn.nft
+ls -lt /var/backups/zero-trust-vpn/firewall/
 ```
 
-**Solutions:**
+- **Locked out of SSH**: if `--confirm-timeout` was used, the previous table
+  comes back by itself after the timeout. Otherwise, from the console:
+  `nft delete table inet ztvpn` removes all rules of this project (the host
+  is then unfiltered by it), fix `ADMIN_ALLOWLIST`/`SSH_PORT` and re-apply.
+  Full previous rulesets are in `/var/backups/zero-trust-vpn/firewall/`.
+- **"applying would lock you out"**: the script compared your SSH session
+  (`SSH_CONNECTION`) with `ADMIN_ALLOWLIST` and `SSH_PORT`. Add your address,
+  or when administering over the VPN add the SSH port to `WG_INPUT_PORTS`.
+- **Containers lost network access after `systemctl restart nftables`**:
+  `/etc/nftables.conf` with `flush ruleset` removed Docker's rules.
+  `systemctl restart docker` recreates them. Re-apply this project's table
+  with `scripts/setup/firewall-setup.sh --apply`.
+- **Blocks or quarantines disappeared**: they are not persisted and are
+  cleared by a reboot or an nftables reload.
 
-1. **Connection Issues**
-   ```bash
-   # Test network connectivity
-   telnet ldap.server.com 389
-   
-   # Check firewall rules
-   sudo ufw allow from authelia_server_ip to ldap_server_ip port 389
-   ```
+## Certificates and CRL
 
-2. **Authentication Issues**
-   ```bash
-   # Verify service account credentials
-   ldapwhoami -x -D "cn=authelia,ou=service,dc=domain,dc=com" -W
-   
-   # Check user search filter
-   ldapsearch -x -D "cn=authelia,ou=service,dc=domain,dc=com" -W \
-     -b "ou=users,dc=domain,dc=com" "(uid=username)"
-   ```
-
-## Certificate Issues
-
-### Certificate Validation Errors
-
-#### Expired Certificates
-
-**Symptoms:**
-- "Certificate has expired" errors
-- SSL/TLS handshake failures
-- Browser security warnings
-
-**Diagnosis:**
-```bash
-# Check certificate expiration
-openssl x509 -in /path/to/cert.pem -noout -dates
-
-# Check certificate chain
-openssl s_client -connect vpn.domain.com:443 -showcerts
+```sh
+scripts/automation/cert-renewal.sh check
+openssl verify -crl_check -CAfile /opt/zero-trust-vpn/certificates/ca/ca.crt \
+    -CRLfile /opt/zero-trust-vpn/certificates/crl/ca.crl \
+    /opt/zero-trust-vpn/certificates/clients/alice--laptop.crt
+openssl crl -in /opt/zero-trust-vpn/certificates/crl/ca.crl -noout -nextupdate
+awk -F'\t' '{print $1, $2, $4, $6}' /opt/zero-trust-vpn/certificates/ca/index.txt
 ```
 
-**Solutions:**
-
-1. **Renew Certificates**
-   ```bash
-   # Using cert-renewal script
-   ./scripts/automation/cert-renewal.sh renew
-   
-   # Manual renewal
-   ./scripts/automation/cert-renewal.sh generate-server
-   ```
-
-2. **Update Certificate References**
-   ```bash
-   # Update WireGuard configuration
-   sudo nano /etc/wireguard/wg0.conf
-   
-   # Update Authelia configuration
-   sudo nano /etc/authelia/configuration.yml
-   
-   # Restart services
-   sudo systemctl restart wg-quick@wg0 authelia
-   ```
-
-#### Certificate Chain Issues
-
-**Diagnosis:**
-```bash
-# Verify certificate chain
-openssl verify -CAfile ca.pem server.pem
-
-# Check certificate details
-openssl x509 -in server.pem -text -noout
-```
-
-**Solutions:**
-
-1. **Fix Certificate Chain**
-   ```bash
-   # Concatenate certificates in correct order
-   cat server.pem intermediate.pem ca.pem > fullchain.pem
-   
-   # Update configuration to use full chain
-   ```
-
-### PKI Management Issues
-
-#### CA Certificate Problems
-
-**Diagnosis:**
-```bash
-# Check CA certificate
-openssl x509 -in ca.pem -text -noout
-
-# Verify CA can sign certificates
-openssl verify -CAfile ca.pem server.pem
-```
-
-**Solutions:**
-
-1. **Regenerate CA (Last Resort)**
-   ```bash
-   # Backup existing certificates
-   cp -r /etc/zero-trust-vpn/pki /backup/pki-$(date +%Y%m%d)
-   
-   # Generate new CA
-   ./scripts/automation/cert-renewal.sh generate-ca --force
-   
-   # Regenerate all certificates
-   ./scripts/automation/cert-renewal.sh generate-server
-   ```
-
-## Network Connectivity
-
-### Routing Issues
-
-#### Cannot Reach Internal Networks
-
-**Symptoms:**
-- VPN connects but cannot access internal resources
-- Partial connectivity to some networks
-- DNS resolution failures
-
-**Diagnosis:**
-```bash
-# Check routing table
-ip route show
-
-# Test connectivity to internal networks
-ping 192.168.1.1
-
-# Check IP forwarding
-cat /proc/sys/net/ipv4/ip_forward
-```
-
-**Solutions:**
-
-1. **Enable IP Forwarding**
-   ```bash
-   # Temporary
-   echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
-   
-   # Permanent
-   echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
-   sudo sysctl -p
-   ```
-
-2. **Fix Routing**
-   ```bash
-   # Add routes for internal networks
-   ip route add 192.168.1.0/24 via 10.100.0.1
-   
-   # Update WireGuard configuration
-   PostUp = ip route add 192.168.1.0/24 via 10.100.0.1
-   ```
-
-3. **NAT Configuration**
-   ```bash
-   # Add NAT rules
-   iptables -t nat -A POSTROUTING -s 10.100.0.0/24 -d 192.168.1.0/24 -j MASQUERADE
-   
-   # Save rules
-   iptables-save > /etc/iptables/rules.v4
-   ```
-
-### DNS Issues
-
-#### DNS Resolution Failures
-
-**Diagnosis:**
-```bash
-# Test DNS resolution
-nslookup google.com
-dig @8.8.8.8 google.com
-
-# Check DNS configuration
-cat /etc/resolv.conf
-
-# Test internal DNS
-nslookup internal.domain.com
-```
-
-**Solutions:**
-
-1. **Fix DNS Configuration**
-   ```bash
-   # Update WireGuard client configuration
-   DNS = 10.100.0.1, 8.8.8.8
-   
-   # Configure DNS server on VPN server
-   # Install and configure dnsmasq or bind9
-   ```
-
-2. **DNS Forwarding**
-   ```bash
-   # Configure conditional forwarding
-   # Forward internal domains to internal DNS
-   # Forward external domains to public DNS
-   ```
-
-## Performance Problems
-
-### High Latency
-
-#### Network Latency Issues
-
-**Diagnosis:**
-```bash
-# Test latency
-ping -c 10 destination
-
-# Trace route
-traceroute destination
-
-# Monitor network performance
-mtr destination
-```
-
-**Solutions:**
-
-1. **Optimize Network Path**
-   ```bash
-   # Choose closer VPN server
-   # Optimize routing
-   # Check for network congestion
-   ```
-
-2. **Tune Network Parameters**
-   ```bash
-   # Increase network buffers
-   echo 'net.core.rmem_max = 134217728' >> /etc/sysctl.conf
-   echo 'net.core.wmem_max = 134217728' >> /etc/sysctl.conf
-   
-   # Optimize TCP settings
-   echo 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.conf
-   ```
-
-### High CPU Usage
-
-#### Server Performance Issues
-
-**Diagnosis:**
-```bash
-# Monitor CPU usage
-top -p $(pgrep wg)
-htop
-
-# Check system load
-uptime
-
-# Monitor system resources
-iostat 1
-```
-
-**Solutions:**
-
-1. **Optimize WireGuard**
-   ```bash
-   # Use hardware acceleration if available
-   # Reduce connection count
-   # Optimize configuration
-   ```
-
-2. **Scale Infrastructure**
-   ```bash
-   # Add more VPN servers
-   # Load balance connections
-   # Upgrade server hardware
-   ```
-
-## Policy Issues
-
-### Access Control Problems
-
-#### Users Cannot Access Resources
-
-**Diagnosis:**
-```bash
-# Check access control policies
-cat /etc/authelia/access-control.yml
-
-# Test policy evaluation
-# Check user groups and permissions
-```
-
-**Solutions:**
-
-1. **Review Policies**
-   ```yaml
-   # Update access control rules
-   access_control:
-     default_policy: deny
-     rules:
-       - domain: "internal.domain.com"
-         policy: two_factor
-         subject: "group:users"
-   ```
-
-2. **Test Policy Changes**
-   ```bash
-   # Validate configuration
-   authelia validate-config /etc/authelia/configuration.yml
-   
-   # Restart Authelia
-   sudo systemctl restart authelia
-   ```
-
-## Monitoring and Logging
-
-### Log Analysis
-
-#### Finding Issues in Logs
-
-**Common Log Locations:**
-```bash
-# WireGuard logs
-/var/log/wireguard/
-journalctl -u wg-quick@wg0
-
-# Authelia logs
-/var/log/authelia/
-journalctl -u authelia
-
-# System logs
-/var/log/syslog
-/var/log/auth.log
-```
-
-**Useful Log Searches:**
-```bash
-# Authentication failures
-grep "authentication failed" /var/log/authelia/authelia.log
-
-# Connection attempts
-grep "handshake" /var/log/wireguard/wg0.log
-
-# Policy violations
-grep "access denied" /var/log/authelia/authelia.log
-
-# Certificate errors
-grep -i "certificate" /var/log/authelia/authelia.log
-```
-
-### Health Monitoring
-
-#### Service Health Checks
-
-**Automated Monitoring:**
-```bash
-# Create health check script
-#!/bin/bash
-# Check WireGuard
-if ! systemctl is-active --quiet wg-quick@wg0; then
-    echo "WireGuard is down"
-    # Send alert
-fi
-
-# Check Authelia
-if ! curl -f http://localhost:9091/api/health; then
-    echo "Authelia is unhealthy"
-    # Send alert
-fi
-```
-
-## Emergency Procedures
-
-### Service Recovery
-
-#### Complete System Recovery
-
-**Steps:**
-1. **Stop all services**
-   ```bash
-   sudo systemctl stop wg-quick@wg0
-   sudo systemctl stop authelia
-   docker-compose down
-   ```
-
-2. **Check system resources**
-   ```bash
-   df -h
-   free -h
-   ps aux | head -20
-   ```
-
-3. **Restore from backup**
-   ```bash
-   # Restore configuration
-   cp /backup/config/* /etc/zero-trust-vpn/
-   
-   # Restore certificates
-   cp /backup/pki/* /etc/zero-trust-vpn/pki/
-   ```
-
-4. **Start services**
-   ```bash
-   sudo systemctl start authelia
-   sudo systemctl start wg-quick@wg0
-   docker-compose up -d
-   ```
-
-### Emergency Access
-
-#### Bypass Authentication (Emergency Only)
-
-**Temporary bypass for emergency access:**
-```bash
-# Create emergency access rule
-# ONLY use in true emergencies
-# Remove immediately after emergency
-
-# Add to Authelia configuration temporarily
-access_control:
-  rules:
-    - domain: "emergency.domain.com"
-      policy: bypass
-      networks:
-        - "trusted_admin_ip/32"
-```
-
-## Getting Help
-
-### Community Resources
-- **WireGuard**: https://lists.zx2c4.com/mailman/listinfo/wireguard
-- **Authelia**: https://github.com/authelia/authelia/discussions
-- **Zero Trust**: https://www.nist.gov/publications/zero-trust-architecture
-
-### Professional Support
-- Consider professional support for production environments
-- Regular security audits and penetration testing
-- Incident response planning
-- Disaster recovery testing
-
-### Documentation
-- Keep detailed documentation of all changes
-- Document troubleshooting procedures
-- Maintain network diagrams
-- Record all emergency procedures
+- `index.txt` columns printed: status (`V` valid, `R` revoked, `E`
+  expired), expiry, serial, subject.
+- **"CRL has expired"** from `openssl verify`: the CRL is valid for 30 days
+  and is regenerated on every revocation and every `pki-setup.sh` run.
+  Run `scripts/setup/pki-setup.sh` (it keeps the CA and the current server
+  certificate).
+- **"No CA at ..."**: run `scripts/setup/pki-setup.sh` first.
+- **"Incomplete CA"**: only one of `ca.crt` / `ca/private/ca.key` exists.
+  Restore the missing file from a backup; `--force` would create a new CA and
+  invalidate every issued certificate.
+- **nginx still serves the old certificate**: `cert-renewal.sh renew` reloads
+  nginx itself; after `pki-setup.sh` run `docker compose restart nginx`.
+
+## Users and devices
+
+- **"Peer ... already exists" / "... already exists" for the client
+  directory**: a device with that name is still enrolled, or a previous
+  attempt left `/opt/zero-trust-vpn/wireguard/clients/<peer>/`. Check with
+  `scripts/management/device-enrollment.sh list --user alice`.
+- **"No free address left in 10.8.0.0/24"**: every address is assigned or
+  reserved by an active quarantine record in `/var/lib/zero-trust-vpn/quarantine/`.
+- **`revoke-user.sh` exits 2**: LDAP backend without `LDAP_DISABLE_HOOK`;
+  disable the directory account yourself.
+- **`user-sync.sh` refuses to revoke**: more users than `--max-revoke`
+  would lose access, which usually means a wrong `LDAP_BASE_DN` or filter.
+  Check the dry-run output before using `--force`.
+
+## Useful state files
+
+| File | Content |
+|---|---|
+| `/var/lib/zero-trust-vpn/device-inventory.json` | enrolled devices |
+| `/var/lib/zero-trust-vpn/incidents/*.json` | `threat-response.sh` incident records |
+| `/var/lib/zero-trust-vpn/quarantine/<peer>/` | removed peers kept for `release` |
+| `/var/lib/zero-trust-vpn/monitor/wg-sample.json` | previous transfer sample for spike detection |
+| `/var/lib/zero-trust-vpn/reports/` | `compliance-check.sh` reports |
+| `/var/log/zero-trust-vpn/audit.log` | who changed users, devices and policies |
+| `/var/log/zero-trust-vpn/alerts.log` | `connection-monitor.sh` alerts |

@@ -1,568 +1,288 @@
-# Zero Trust VPN Infrastructure 🔐🌐
+# Zero Trust VPN Infrastructure
 
-This repository documents the implementation of a secure remote access solution using WireGuard VPN with Zero Trust principles. The infrastructure ensures that no user or device is trusted by default, and every access request is verified, authenticated, and authorized before granting access to network resources.
+Shell scripts and configuration for a single Debian/Ubuntu host that gives
+remote users access to internal web applications through WireGuard, with
+every application request authenticated and authorized by Authelia (password
+plus TOTP or WebAuthn) at an nginx reverse proxy.
 
-**Important Note:** Zero Trust architecture requires careful planning and implementation. The configurations provided here serve as a foundation but must be adapted to your specific security requirements and network topology.
+"Zero trust" here means one specific thing: being connected to the VPN grants
+no access to applications by itself. The tunnel only lets a device reach the
+reverse proxy, and the proxy asks Authelia about every request. It does not
+mean device posture checks, per-user network segmentation or continuous
+risk scoring; none of those exist in this project (see
+[Limitations](#limitations)).
 
-## 🎯 Goals
+## What it is
 
-* Implement Zero Trust network access principles
-* Provide secure remote access to internal resources
-* Ensure strong authentication and authorization for all connections
-* Enable granular access control based on user identity and device posture
-* Maintain comprehensive logging and monitoring of all access attempts
-* Support scalable user and device management
+- `wg-quick@wg0` on the host. Peers are authenticated by their WireGuard key
+  and a per-peer preshared key.
+- One nftables table, `inet ztvpn` (IPv4 and IPv6), that drops by default.
+  VPN clients may reach only `SERVICES_SUBNET` on `SERVICES_PORTS` (default
+  tcp/443, the reverse proxy). No client-to-client traffic, no internet egress
+  unless `FULL_TUNNEL=yes`.
+- A Docker Compose stack: nginx (the only service with published ports),
+  Authelia 4.39, PostgreSQL and Redis for Authelia, plus an optional
+  `monitoring` profile (Prometheus, Alertmanager, Grafana, Loki).
+- nginx protects every application with Authelia forward auth
+  (`auth_request`). Authelia's access control is `default_policy: deny`, every
+  shipped rule is `two_factor`, limited to the `vpn` network (`VPN_SUBNET`)
+  and to specific groups.
+- A small private CA (OpenSSL) for the proxy's TLS certificate and optional
+  client certificates, with a CRL.
+- Scripts for setup, users, devices, access rules, certificate renewal,
+  incident containment, LDAP reconciliation, monitoring and a technical audit.
 
-## 🛠️ Technologies Used
+## What it is not
 
-* [WireGuard](https://www.wireguard.com/) - Modern VPN protocol
-* [wg-easy](https://github.com/wg-easy/wg-easy) - WireGuard management interface
-* [Authelia](https://www.authelia.com/) - Authentication and authorization server
-* [LDAP](https://ldap.com/) or [Active Directory](https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/) - User directory
-* [FreeIPA](https://www.freeipa.org/) - Identity management (alternative)
-* [pfSense](https://www.pfsense.org/) or [OPNsense](https://opnsense.org/) - Firewall integration
-* [Suricata](https://suricata.io/) - Network intrusion detection
-* [ELK Stack](https://www.elastic.co/elk-stack) - Logging and monitoring
-* [Docker](https://www.docker.com/) - Containerization
-* [Ansible](https://www.ansible.com/) - Configuration management
+- Not an identity provider. Users live in Authelia's users file (managed by
+  the scripts) or in your LDAP/AD directory.
+- Not multi-host or highly available. Everything runs on one machine.
+- Not a way to expose arbitrary TCP/UDP services. Only HTTP(S) applications
+  behind nginx get per-user authorization.
+- Not scheduled. Nothing runs by itself; add cron jobs or systemd timers for
+  the automation and monitoring scripts if you want them periodic.
 
-## ✨ Key Features/Highlights
-
-* **Zero Trust Architecture:** Never trust, always verify principle
-* **Multi-Factor Authentication:** TOTP, FIDO2, and certificate-based authentication
-* **Device Posture Assessment:** Continuous device health and compliance checking
-* **Conditional Access:** Context-aware access policies
-* **Micro-Segmentation:** Granular network access controls
-* **Session Management:** Dynamic session policies and timeout controls
-* **Comprehensive Logging:** Detailed audit trails for all access attempts
-* **Automated Certificate Management:** PKI infrastructure with automatic rotation
-* **Threat Detection:** Real-time monitoring and automated response
-* **Scalable Architecture:** Support for thousands of users and devices
-
-## 🏛️ Repository Structure
-
-```
-zero-trust-vpn-infrastructure/
-├── README.md
-├── docs/
-│   ├── architecture-overview.md
-│   ├── zero-trust-principles.md
-│   ├── installation-guide.md
-│   ├── user-management.md
-│   ├── device-enrollment.md
-│   ├── policy-configuration.md
-│   └── troubleshooting.md
-├── config-examples/
-│   ├── wireguard/
-│   │   ├── wg0.conf.example
-│   │   └── client-template.conf
-│   ├── authelia/
-│   │   ├── configuration.yml
-│   │   ├── users_database.yml
-│   │   └── access-control.yml
-│   ├── pki/
-│   │   ├── ca.conf
-│   │   ├── server.conf
-│   │   └── client.conf
-│   ├── firewall/
-│   │   ├── pfsense-rules.xml
-│   │   └── iptables-rules.sh
-│   └── docker/
-│       ├── docker-compose.yml
-│       └── .env.example
-├── scripts/
-│   ├── setup/
-│   │   ├── initial-setup.sh
-│   │   ├── pki-setup.sh
-│   │   ├── wireguard-setup.sh
-│   │   └── authelia-setup.sh
-│   ├── management/
-│   │   ├── add-user.sh
-│   │   ├── revoke-user.sh
-│   │   ├── device-enrollment.sh
-│   │   └── policy-update.sh
-│   ├── monitoring/
-│   │   ├── connection-monitor.sh
-│   │   ├── security-audit.sh
-│   │   └── compliance-check.sh
-│   └── automation/
-│       ├── cert-renewal.sh
-│       ├── user-sync.sh
-│       └── threat-response.sh
-└── certificates/
-    ├── ca/
-    ├── server/
-    ├── clients/
-    └── crl/
-```
-
-## 🏗️ Zero Trust Architecture
-
-### Core Principles
-
-1. **Never Trust, Always Verify**
-   - Every user and device must be authenticated
-   - Continuous verification throughout the session
-   - No implicit trust based on network location
-
-2. **Least Privilege Access**
-   - Minimum necessary access granted
-   - Just-in-time access provisioning
-   - Regular access reviews and revocation
-
-3. **Assume Breach**
-   - Continuous monitoring for threats
-   - Rapid incident response capabilities
-   - Lateral movement prevention
-
-### Network Architecture
+## Architecture
 
 ```
-Internet
-    │
-    ▼
-┌─────────────────┐
-│   Load Balancer │
-│   (HAProxy)     │
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│   WAF/DDoS     │
-│   Protection    │
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│   Authentication│
-│   Gateway       │
-│   (Authelia)    │
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│   WireGuard     │
-│   VPN Server    │
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│   Internal      │
-│   Networks      │
-│   (Segmented)   │
-└─────────────────┘
+ client device                              VPN host (Debian/Ubuntu)
++------------------+    UDP 51820     +------------------------------------------------+
+| WireGuard client |=================>| wg0  10.8.0.1/24   (wg-quick@wg0)              |
+|  10.8.0.x/32     |  key + PSK only  |   |                                            |
+|                  |                  |   v                                            |
+| browser          |                  | nftables "inet ztvpn": wg0 -> SERVICES_SUBNET  |
++------------------+                  |   tcp/443 only, everything else dropped        |
+                                      |   |                                            |
+                                      |   v   (Docker DNAT of published 443)           |
+                                      | +---------------- docker compose ------------+ |
+                                      | | nginx :443                                 | |
+                                      | |   vpn-only.inc: allow VPN_SUBNET only      | |
+                                      | |   auth_request --------> authelia :9091    | |
+                                      | |   |  (2xx: proxy on)       |        |      | |
+                                      | |   v                    postgres  redis     | |
+                                      | | application upstream                       | |
+                                      | | (shipped: grafana, prometheus,             | |
+                                      | |  alertmanager in profile "monitoring")     | |
+                                      | +--------------------------------------------+ |
+                                      +------------------------------------------------+
 ```
 
-## 🚀 Getting Started / Configuration
+Request path: the WireGuard handshake proves possession of a device key. The
+client then opens `https://<app>.<DOMAIN>`, which must resolve to the proxy's
+address in `SERVICES_SUBNET`. nginx refuses anything not from `VPN_SUBNET`,
+asks Authelia (`/api/authz/auth-request`), redirects to the portal at
+`AUTH_DOMAIN` when there is no session, and forwards the request with
+`Remote-User`/`Remote-Groups` headers only when Authelia allows it. Details
+and the NIST SP 800-207 mapping: [docs/architecture.md](docs/architecture.md).
 
-### Prerequisites
+## Security model
 
-1. **Infrastructure Requirements:**
-   - Linux server (Ubuntu 20.04+ recommended)
-   - Public IP address with domain name
-   - SSL certificate for authentication portal
-   - Minimum 2GB RAM, 4GB+ recommended
+| Layer | Enforced by | Decides on |
+|---|---|---|
+| Network access | WireGuard (`wg0.conf`) | Device key + preshared key. No user identity, no MFA. |
+| Reachability | nftables `inet ztvpn` | Source in `VPN_SUBNET`, destination `SERVICES_SUBNET:SERVICES_PORTS`, blocklist/quarantine sets |
+| Application access | nginx + Authelia | Session (password + TOTP/WebAuthn), group/user, domain, path, method, `vpn` network; default deny |
+| Revocation | `revoke-user.sh`, `threat-response.sh` | Removes peers from the live interface, disables the account, revokes certificates |
 
-2. **Network Requirements:**
-   - UDP port 51820 for WireGuard
-   - TCP port 443 for authentication portal
-   - Internal network subnets defined
+## Limitations
 
-### Quick Start
+Read these before relying on the setup.
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/Xieonie/zero-trust-vpn-infrastructure.git
-   cd zero-trust-vpn-infrastructure
-   ```
+- **WireGuard keys are device credentials without MFA.** Anyone holding a
+  client config (private key and PSK) gets onto the tunnel. Authelia still
+  guards every application, but the proxy and portal are reachable.
+- **Client private keys are generated on the server** and stay in
+  `/opt/zero-trust-vpn/wireguard/clients/<peer>/` until you delete them
+  (`security-audit.sh` reports this as `FILE-WG-CLIENT-KEYS-ON-SERVER`).
+- **No device posture.** Nothing checks OS version, disk encryption, EDR or
+  anything else about the client device.
+- **X.509 client certificates are not enforced.** `--cert` issues them and
+  revocation puts them on the CRL, but the shipped nginx templates do not
+  use `ssl_verify_client`. Enabling mTLS is up to you.
+- **Per-user authorization exists only at the HTTP layer.** The firewall
+  treats all peers the same: every peer can reach
+  `SERVICES_SUBNET:SERVICES_PORTS`. Adding a port there that is not behind
+  nginx and Authelia exposes it to every peer without authentication.
+- **nginx publishes 80/443 on all host interfaces.** Docker's DNAT bypasses
+  the `input` chain, so the proxy is reachable from the internet at the TCP
+  level. For known host names nginx completes the TLS handshake and answers
+  403 to non-VPN addresses (`vpn-only.inc`); unknown names get no handshake.
+  `PUBLIC_TCP_PORTS` only affects a proxy running natively on the host.
+- **Disabling a user is not instant for web sessions.** Authelia re-reads the
+  user after `refresh_interval` (1 minute in the shipped config). Tunnels are
+  cut immediately because peers are removed from the running interface.
+- **LDAP backend:** `add-user.sh` cannot create directory accounts, and
+  `revoke-user.sh` can disable one only through an `LDAP_DISABLE_HOOK` you
+  provide; otherwise it exits 2 and reports the manual step.
+  `user-sync.sh` reconciles VPN access with the directory.
+- **No password change or account re-enable.** Password change and reset in
+  the portal are disabled because the users file is managed by the scripts,
+  and no script sets a new password or re-enables a disabled account. The
+  onboarding files tell users to change their password at first login; the
+  shipped configuration does not allow that.
+- **Blocklist and quarantine entries are not persistent.** They are carried
+  over when `firewall-setup.sh --apply` re-applies the table, but a reboot or
+  an nftables reload empties the sets.
+- **Traffic from nginx to upstreams is plain HTTP** on the Docker network.
+- **The tunnel is IPv4 only.** IPv6 arriving through the tunnel is dropped.
+- **The CA key is encrypted, but its passphrase is on the same host**
+  (`/etc/zero-trust-vpn/secrets/ca.pass`). The CRL is only a local file;
+  `PKI_CRL_URL` embeds a URL in certificates but nothing publishes the CRL.
+- **Only three application vhosts are shipped** (Grafana, Prometheus,
+  Alertmanager, all in the `monitoring` profile, which needs your own
+  `prometheus.yml` and `alertmanager.yml`). The Authelia rules for
+  `admin`, `security`, `support`, `intranet`, `projects`, `guest` and
+  `selfservice` have no nginx server blocks; add your own.
+- **Second-factor registration codes go to a file** inside the Authelia
+  container (`/data/notification.txt`) until you configure SMTP.
 
-2. **Run initial setup:**
-   ```bash
-   sudo ./scripts/setup/initial-setup.sh
-   ```
+## Requirements
 
-3. **Configure environment:**
-   ```bash
-   cp config-examples/docker/.env.example .env
-   # Edit .env with your specific settings
-   ```
+- Debian or Ubuntu with systemd, run as root. `initial-setup.sh` refuses
+  other distributions unless `--skip-packages` is given.
+- amd64 or arm64 for the pinned `yq` download (otherwise install
+  mikefarah/yq v4 yourself).
+- A public address for `VPN_ENDPOINT`, UDP `WG_PORT` (51820) reachable.
+- An address of the host inside `SERVICES_SUBNET` on which clients reach the
+  proxy (typically its LAN address).
+- DNS names under `DOMAIN` for the portal (`AUTH_DOMAIN`) and applications
+  that resolve, for VPN clients, to that proxy address. No resolver is shipped.
+- Packages installed by `initial-setup.sh`: `wireguard-tools nftables
+  conntrack openssl jq argon2 qrencode ca-certificates curl iproute2
+  util-linux`, Docker Engine
+  with the compose plugin (from download.docker.com), `yq` v4.44.3 (checksum
+  pinned). `user-sync.sh` additionally needs `ldapsearch` (`ldap-utils`).
 
-4. **Set up PKI infrastructure:**
-   ```bash
-   ./scripts/setup/pki-setup.sh
-   ```
+## Quick start
 
-5. **Deploy the stack:**
-   ```bash
-   docker-compose up -d
-   ```
+Full guide: [docs/installation.md](docs/installation.md).
 
-6. **Configure first admin user:**
-   ```bash
-   ./scripts/management/add-user.sh admin admin@example.com --admin
-   ```
+```sh
+# 1. Clone as root into a root-owned directory (the scripts run as root and
+#    read templates from the checkout). Plain git; no Git LFS needed.
+git clone https://github.com/Xieonie/zero-trust-vpn-infrastructure.git
+cd zero-trust-vpn-infrastructure
 
-## 🔐 Authentication and Authorization
+# 2. Central configuration
+install -d -m 755 /etc/zero-trust-vpn
+install -m 600 config-examples/ztvpn.conf.example /etc/zero-trust-vpn/ztvpn.conf
+editor /etc/zero-trust-vpn/ztvpn.conf
+#    at least: DOMAIN, AUTH_DOMAIN, VPN_ENDPOINT, PKI_SERVER_SANS,
+#    SERVICES_SUBNET, ADMIN_ALLOWLIST (your SSH source address)
 
-### Multi-Factor Authentication
+# 3. Install and configure everything
+scripts/setup/initial-setup.sh --admin-email admin@yourdomain.tld
+#    Over SSH the firewall step rolls back after 120 s unless you confirm
+#    (press Enter) after checking a second SSH session still gets in.
+#    The first Authelia admin's password is written to
+#    /etc/zero-trust-vpn/secrets/onboarding/authelia-admin.txt
 
-#### TOTP (Time-based One-Time Password)
-```yaml
-# authelia configuration
-authentication_backend:
-  file:
-    path: /config/users_database.yml
-    password:
-      algorithm: argon2id
+# 4. First user with a device
+scripts/management/add-user.sh alice alice@yourdomain.tld --name "Alice Example" --device laptop --qr
+#    prints key=value lines: client_config=, qr=, onboarding=
 
-totp:
-  issuer: "Zero Trust VPN"
-  algorithm: sha1
-  digits: 6
-  period: 30
-  skew: 1
+# 5. The admin account has no VPN device yet
+scripts/management/device-enrollment.sh enroll --user admin --device laptop
 ```
 
-#### FIDO2/WebAuthn
-```yaml
-webauthn:
-  timeout: 60s
-  display_name: "Zero Trust VPN"
-  attestation_conveyance_preference: indirect
-  user_verification: preferred
+Connecting a client:
+
+1. Hand over the client config
+   (`/opt/zero-trust-vpn/wireguard/clients/alice--laptop/alice--laptop.conf`,
+   or the QR code) and the onboarding file over a secure channel, then delete
+   the server copies of the private key and onboarding file.
+2. Import the config into the WireGuard app (or `wg-quick up` on Linux).
+3. Install the CA certificate `/opt/zero-trust-vpn/certificates/ca/ca.crt` as
+   trusted on the device; the proxy's certificate is issued by this CA.
+4. Open `https://<AUTH_DOMAIN>`, log in with the onboarding password and
+   register TOTP or WebAuthn. The confirmation code for that step is written
+   to the notifier file: `docker compose exec authelia cat /data/notification.txt`
+   (run in `/opt/zero-trust-vpn`).
+
+## Day-2 operations
+
+Details and examples: [docs/operations.md](docs/operations.md).
+
+| Script | Purpose |
+|---|---|
+| `scripts/setup/initial-setup.sh` | Packages, directories, runs the four setup steps, deploys compose + nginx files, starts the stack. Safe to re-run. |
+| `scripts/setup/pki-setup.sh` | Creates the CA (never replaces it without `--force`), issues/renews the proxy certificate, regenerates the CRL. |
+| `scripts/setup/firewall-setup.sh` | Renders (`--print`) or applies (`--apply`) the `inet ztvpn` nftables table, with optional rollback timer. |
+| `scripts/setup/wireguard-setup.sh` | Server keys, `[Interface]` of `wg0.conf` (peers kept), IPv4 forwarding, `wg-quick@wg0`. |
+| `scripts/setup/authelia-setup.sh` | Authelia config, secret files, users file and first admin; `--validate` runs `authelia validate-config`. |
+| `scripts/management/add-user.sh` | Authelia account with random password + first WireGuard peer (optional client cert, QR). Rolls back on failure. |
+| `scripts/management/revoke-user.sh` | Disables/deletes the account, removes all peers of the user, revokes their certificates, marks inventory. |
+| `scripts/management/device-enrollment.sh` | `enroll`, `remove`, `list`, `show` additional devices (`<user>--<device>` peers). |
+| `scripts/management/policy-update.sh` | Access-control rules and group membership in the live Authelia config, validated with rollback; backup/restore. |
+| `scripts/automation/cert-renewal.sh` | `check` expiry (exit 0/1/2), `renew` server certificates and reload nginx. |
+| `scripts/automation/threat-response.sh` | Block IPs with expiring nftables set entries, quarantine peers, contain compromised devices/users; `unblock`, `release`. |
+| `scripts/automation/user-sync.sh` | Revokes VPN access of users missing, disabled or not in the required group in LDAP/AD. Dry run unless `--apply`. |
+| `scripts/monitoring/connection-monitor.sh` | Peer handshakes and transfer, unknown peers, traffic spikes, failed Authelia logins; `--respond` blocks brute force. |
+| `scripts/monitoring/security-audit.sh` | 31 technical checks with stable IDs (permissions, PKI, WireGuard, firewall, Docker ports, Authelia, identities). |
+| `scripts/monitoring/compliance-check.sh` | Maps audit results to ISO 27001:2022 and NIST SP 800-207 controls; organisational parts stay `MANUAL`. |
+
+Every script has `--help`. Management scripts append to
+`/var/log/zero-trust-vpn/audit.log`.
+
+## Configuration
+
+All scripts read `/etc/zero-trust-vpn/ztvpn.conf` (override the path with
+`ZTVPN_CONFIG`). It is parsed as plain `KEY=VALUE` lines and never executed;
+the loader refuses the file if it is group/world writable or owned by
+another non-root user. Environment variables override the file. Defaults
+and canonical paths are in `scripts/lib/common.sh`:
+
+| Path | Content |
+|---|---|
+| `/etc/zero-trust-vpn/ztvpn.conf` | central config |
+| `/etc/zero-trust-vpn/secrets/` | CA passphrase, onboarding files, optional LDAP bind password |
+| `/etc/wireguard/wg0.conf`, `server_*.key` | WireGuard server |
+| `/opt/zero-trust-vpn/` | `docker-compose.yml`, `.env`, `nginx/`, `authelia/`, `certificates/`, `wireguard/clients/` |
+| `/var/lib/zero-trust-vpn/` | device inventory, quarantine records, incidents, reports, locks |
+| `/var/log/zero-trust-vpn/` | per-script logs, `audit.log`, `alerts.log` |
+| `/var/backups/zero-trust-vpn/` | backups the scripts make before replacing things, revoked key archives |
+| `/etc/nftables.d/ztvpn.nft` | persisted firewall table, included from `/etc/nftables.conf` |
+
+## Repository layout
+
+```
+scripts/lib/          common.sh (config, paths, validation, audit log), wireguard.sh, authelia.sh, pki.sh
+scripts/setup/        initial-setup, pki-setup, firewall-setup, wireguard-setup, authelia-setup
+scripts/management/   add-user, revoke-user, device-enrollment, policy-update
+scripts/automation/   cert-renewal, threat-response, user-sync
+scripts/monitoring/   connection-monitor, security-audit, compliance-check
+config-examples/      ztvpn.conf.example
+  docker/             docker-compose.yml, .env.example
+  authelia/           configuration.yml, configuration.ldap.yml, users_database.yml (format only)
+  nginx/              templates/ (portal, apps, vpn-only.inc), snippets/ (forward auth, proxy headers)
+  firewall/           ztvpn.nft.example (default rendering), pfsense-rules.xml (illustrative)
+  wireguard/          wg0.conf.example, client-template.conf
+  pki/                README.md (the OpenSSL config is generated)
+certificates/         empty placeholders; generated key material is git-ignored
+tests/                bats suites and test_helper.bash
+docs/                 architecture, installation, operations, troubleshooting
 ```
 
-### Access Control Policies
+## Testing
 
-```yaml
-# access-control.yml
-access_control:
-  default_policy: deny
-  
-  rules:
-    # Admin access
-    - domain: "admin.vpn.example.com"
-      policy: two_factor
-      subject: "group:admins"
-      
-    # Developer access to development resources
-    - domain: "dev.internal.example.com"
-      policy: two_factor
-      subject: "group:developers"
-      resources:
-        - "^/api/.*$"
-        - "^/dev/.*$"
-        
-    # User access to general resources
-    - domain: "*.internal.example.com"
-      policy: two_factor
-      subject: "group:users"
-      resources:
-        - "^/public/.*$"
+The bats suites in `tests/` run every script against a sandbox: all paths
+point into `$BATS_TEST_TMPDIR` (`tests/test_helper.bash`), firewall apply
+tests use a stub `nft` or a private network namespace, so the host is not
+modified. The scripts require root, so run the suites as root:
+
+```sh
+apt-get install bats shellcheck wireguard-tools argon2 jq openssl nftables   # plus mikefarah/yq v4
+sudo -E bats tests/
 ```
 
-## 🔧 WireGuard Configuration
+Tests that need Docker images (`authelia/authelia:4.39`, nginx) or
+`CAP_NET_ADMIN` are skipped when those are not available.
 
-### Server Configuration
+CI (`.github/workflows/ci.yml`, on every push and pull request): `bash -n`
+and `shellcheck -x -S warning` on every `*.sh`, a check that no script is a
+Git LFS pointer, YAML parsing of every tracked `*.yml`/`*.yaml` with `yq`,
+and `sudo -E bats tests/`.
 
-```ini
-# wg0.conf
-[Interface]
-PrivateKey = SERVER_PRIVATE_KEY
-Address = 10.10.0.1/24
-ListenPort = 51820
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+## License
 
-# Client configurations added dynamically
-```
-
-### Dynamic Client Management
-
-```bash
-#!/bin/bash
-# add-user.sh
-
-USER_EMAIL=$1
-USER_GROUP=$2
-
-# Generate key pair
-PRIVATE_KEY=$(wg genkey)
-PUBLIC_KEY=$(echo $PRIVATE_KEY | wg pubkey)
-
-# Assign IP address
-NEXT_IP=$(get_next_available_ip)
-
-# Create client configuration
-cat > "clients/${USER_EMAIL}.conf" << EOF
-[Interface]
-PrivateKey = $PRIVATE_KEY
-Address = $NEXT_IP/32
-DNS = 10.10.0.1
-
-[Peer]
-PublicKey = $(cat server_public.key)
-Endpoint = vpn.example.com:51820
-AllowedIPs = 10.0.0.0/8, 192.168.0.0/16
-PersistentKeepalive = 25
-EOF
-
-# Add to server configuration
-wg set wg0 peer $PUBLIC_KEY allowed-ips $NEXT_IP/32
-
-# Update user database
-add_user_to_authelia $USER_EMAIL $USER_GROUP
-
-echo "User $USER_EMAIL added successfully"
-echo "Configuration file: clients/${USER_EMAIL}.conf"
-```
-
-## 🛡️ Security Implementation
-
-### Device Posture Assessment
-
-```python
-# device_posture.py
-import subprocess
-import json
-from datetime import datetime
-
-class DevicePostureChecker:
-    def __init__(self):
-        self.required_checks = [
-            'antivirus_status',
-            'firewall_status',
-            'os_updates',
-            'disk_encryption',
-            'screen_lock'
-        ]
-    
-    def check_device_posture(self, device_id):
-        results = {}
-        
-        for check in self.required_checks:
-            results[check] = getattr(self, f'check_{check}')()
-        
-        compliance_score = sum(results.values()) / len(results)
-        
-        return {
-            'device_id': device_id,
-            'timestamp': datetime.now().isoformat(),
-            'compliance_score': compliance_score,
-            'details': results,
-            'compliant': compliance_score >= 0.8
-        }
-    
-    def check_antivirus_status(self):
-        # Implementation for antivirus check
-        return True
-    
-    def check_firewall_status(self):
-        # Implementation for firewall check
-        return True
-```
-
-### Conditional Access Policies
-
-```yaml
-# conditional_access.yml
-policies:
-  - name: "High Risk Location"
-    conditions:
-      - location_risk: high
-    actions:
-      - require_mfa: true
-      - session_timeout: 1800
-      - require_device_compliance: true
-      
-  - name: "Privileged Access"
-    conditions:
-      - resource_sensitivity: high
-      - user_role: admin
-    actions:
-      - require_mfa: true
-      - require_piv_card: true
-      - session_timeout: 900
-      - require_approval: true
-      
-  - name: "Off-Hours Access"
-    conditions:
-      - time_of_day: "18:00-08:00"
-      - day_of_week: "saturday,sunday"
-    actions:
-      - require_justification: true
-      - notify_security_team: true
-      - enhanced_logging: true
-```
-
-## 📊 Monitoring and Logging
-
-### Comprehensive Logging
-
-```yaml
-# logging configuration
-logging:
-  level: info
-  format: json
-  
-  outputs:
-    - type: file
-      path: /var/log/authelia/authelia.log
-    - type: syslog
-      facility: auth
-    - type: elasticsearch
-      endpoint: https://elk.internal.example.com:9200
-      
-  events:
-    - authentication_attempts
-    - authorization_decisions
-    - session_events
-    - configuration_changes
-    - security_incidents
-```
-
-### Security Metrics
-
-```python
-# metrics.py
-from prometheus_client import Counter, Histogram, Gauge
-
-# Authentication metrics
-auth_attempts_total = Counter('auth_attempts_total', 'Total authentication attempts', ['result', 'method'])
-auth_duration = Histogram('auth_duration_seconds', 'Authentication duration')
-
-# VPN metrics
-vpn_connections_active = Gauge('vpn_connections_active', 'Active VPN connections')
-vpn_data_transferred = Counter('vpn_data_transferred_bytes', 'Data transferred through VPN', ['direction'])
-
-# Security metrics
-security_incidents = Counter('security_incidents_total', 'Security incidents detected', ['type', 'severity'])
-policy_violations = Counter('policy_violations_total', 'Policy violations detected', ['policy', 'user'])
-```
-
-### Automated Threat Response
-
-```bash
-#!/bin/bash
-# threat-response.sh
-
-THREAT_TYPE=$1
-SOURCE_IP=$2
-USER_ID=$3
-
-case $THREAT_TYPE in
-    "brute_force")
-        # Block IP address
-        iptables -I INPUT -s $SOURCE_IP -j DROP
-        # Disable user account temporarily
-        ./scripts/management/disable-user.sh $USER_ID
-        ;;
-    "anomalous_behavior")
-        # Require re-authentication
-        ./scripts/management/force-reauth.sh $USER_ID
-        # Increase monitoring
-        ./scripts/monitoring/enhanced-monitoring.sh $USER_ID
-        ;;
-    "malware_detected")
-        # Quarantine device
-        ./scripts/management/quarantine-device.sh $SOURCE_IP
-        # Notify security team
-        ./scripts/notifications/security-alert.sh "Malware detected" $USER_ID
-        ;;
-esac
-
-# Log incident
-echo "$(date): Threat response executed for $THREAT_TYPE from $SOURCE_IP (user: $USER_ID)" >> /var/log/security-incidents.log
-```
-
-## 🔧 Advanced Features
-
-### Certificate-Based Authentication
-
-```bash
-#!/bin/bash
-# pki-setup.sh
-
-# Create CA
-openssl genrsa -out ca-key.pem 4096
-openssl req -new -x509 -days 3650 -key ca-key.pem -out ca.pem
-
-# Create server certificate
-openssl genrsa -out server-key.pem 4096
-openssl req -new -key server-key.pem -out server.csr
-openssl x509 -req -days 365 -in server.csr -CA ca.pem -CAkey ca-key.pem -out server.pem
-
-# Create client certificate template
-create_client_cert() {
-    local username=$1
-    openssl genrsa -out "clients/${username}-key.pem" 4096
-    openssl req -new -key "clients/${username}-key.pem" -out "clients/${username}.csr"
-    openssl x509 -req -days 365 -in "clients/${username}.csr" -CA ca.pem -CAkey ca-key.pem -out "clients/${username}.pem"
-}
-```
-
-### API Integration
-
-```python
-# api_integration.py
-from flask import Flask, request, jsonify
-import jwt
-import requests
-
-app = Flask(__name__)
-
-@app.route('/api/v1/access-request', methods=['POST'])
-def handle_access_request():
-    token = request.headers.get('Authorization')
-    user_info = validate_token(token)
-    
-    if not user_info:
-        return jsonify({'error': 'Invalid token'}), 401
-    
-    # Check device posture
-    device_compliant = check_device_posture(user_info['device_id'])
-    
-    # Evaluate access policies
-    access_decision = evaluate_access_policies(user_info, request.json)
-    
-    if access_decision['allowed'] and device_compliant:
-        # Generate temporary access credentials
-        temp_creds = generate_temp_credentials(user_info)
-        return jsonify({
-            'access_granted': True,
-            'credentials': temp_creds,
-            'expires_at': access_decision['expires_at']
-        })
-    else:
-        return jsonify({
-            'access_granted': False,
-            'reason': access_decision['reason']
-        }), 403
-```
-
-## 🔮 Potential Improvements/Future Plans
-
-* Integration with SIEM platforms for advanced threat detection
-* Machine learning-based anomaly detection
-* Integration with cloud identity providers (Azure AD, Okta)
-* Mobile device management (MDM) integration
-* Automated compliance reporting
-* Integration with privileged access management (PAM) solutions
-* Support for software-defined perimeter (SDP) protocols
-
-## ⚠️ Security Considerations
-
-* **Key Management:** Secure storage and rotation of cryptographic keys
-* **Certificate Lifecycle:** Automated certificate renewal and revocation
-* **Session Security:** Secure session management and timeout policies
-* **Audit Trails:** Comprehensive logging for compliance and forensics
-* **Incident Response:** Rapid response to security incidents
-* **Regular Updates:** Keep all components updated with security patches
-
-## 📚 Additional Resources
-
-* [NIST Zero Trust Architecture](https://csrc.nist.gov/publications/detail/sp/800-207/final)
-* [WireGuard Protocol Specification](https://www.wireguard.com/protocol/)
-* [Zero Trust Security Model](https://www.cloudflare.com/learning/security/glossary/what-is-zero-trust/)
-* [Authelia Documentation](https://www.authelia.com/docs/)
-* [CISA Zero Trust Maturity Model](https://www.cisa.gov/zero-trust-maturity-model)
+The repository contains no license file.
