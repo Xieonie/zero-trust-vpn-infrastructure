@@ -1,652 +1,192 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Sets up the WireGuard server interface.
+#
+# Writes the server key pair (only if missing), the [Interface] section of
+# $WG_CONF (existing peers are kept), an IPv4 forwarding sysctl drop-in and
+# enables wg-quick@<interface>. Forwarding/NAT rules are NOT set here: they
+# live in nftables (scripts/setup/firewall-setup.sh). Peers are managed by
+# scripts/management/add-user.sh and revoke-user.sh.
 
-# Zero Trust VPN - WireGuard Setup Script
-# This script sets up and configures WireGuard VPN server with security best practices
+set -Eeuo pipefail
 
-set -euo pipefail
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-CONFIG_DIR="/etc/wireguard"
-CERT_DIR="/opt/zero-trust-vpn/certificates"
-LOG_FILE="/var/log/zero-trust-vpn/wireguard-setup.log"
+ZTVPN_SYSCTL_FILE="${ZTVPN_SYSCTL_FILE:-/etc/sysctl.d/99-ztvpn.conf}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/wireguard-setup.log}"
 
-# Default values
-WG_INTERFACE="wg0"
-WG_PORT="51820"
-WG_NETWORK="10.8.0.0/24"
-WG_SERVER_IP="10.8.0.1"
-DNS_SERVERS="1.1.1.1,1.0.0.1"
-EXTERNAL_INTERFACE=""
-SERVER_PUBLIC_IP=""
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Logging function
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-}
-
-# Error handling
-error_exit() {
-    echo -e "${RED}ERROR: $1${NC}" >&2
-    log "ERROR: $1"
-    exit 1
-}
-
-# Warning function
-warning() {
-    echo -e "${YELLOW}WARNING: $1${NC}"
-    log "WARNING: $1"
-}
-
-# Success function
-success() {
-    echo -e "${GREEN}SUCCESS: $1${NC}"
-    log "SUCCESS: $1"
-}
-
-# Info function
-info() {
-    echo -e "${BLUE}INFO: $1${NC}"
-    log "INFO: $1"
-}
-
-# Usage function
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
 
-Set up WireGuard VPN server for Zero Trust infrastructure
+Configure the WireGuard server interface $WG_INTERFACE.
 
-OPTIONS:
-    -i, --interface INTERFACE    WireGuard interface name (default: wg0)
-    -p, --port PORT             WireGuard listen port (default: 51820)
-    -n, --network NETWORK       VPN network CIDR (default: 10.8.0.0/24)
-    -s, --server-ip IP          Server IP within VPN network (default: 10.8.0.1)
-    -d, --dns DNS               DNS servers (default: 1.1.1.1,1.0.0.1)
-    -e, --external-interface IF  External network interface (auto-detect if not specified)
-    -a, --server-address ADDR   Public server address/IP
-    -f, --force                 Force overwrite existing configuration
-    -h, --help                  Show this help message
+  - server key pair: $WG_SERVER_KEY / $WG_SERVER_PUBKEY (created if missing)
+  - $WG_CONF: [Interface] Address=$VPN_SERVER_IP/${VPN_SUBNET#*/}, ListenPort=$WG_PORT;
+    existing [Peer] sections are preserved
+  - $ZTVPN_SYSCTL_FILE: net.ipv4.ip_forward=1
+  - systemctl enable --now wg-quick@$WG_INTERFACE (reload if already running)
 
-EXAMPLES:
-    $0                          # Use default settings
-    $0 --port 51821 --network 10.9.0.0/24
-    $0 --server-address vpn.example.com --dns 8.8.8.8,8.8.4.4
+Options:
+  --force       Generate a new server key pair (old one is backed up to
+                $ZTVPN_BACKUP_DIR). Every client config must be re-issued.
+  --no-start    Do not enable/start/reload the systemd unit
+  -h, --help    Show this help
 
+Settings (ztvpn.conf or environment): WG_INTERFACE, WG_PORT, VPN_SUBNET,
+VPN_SERVER_IP, WG_DIR, WG_CONF, WG_SERVER_KEY, WG_SERVER_PUBKEY.
 EOF
 }
 
-# Parse command line arguments
-FORCE=false
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -i|--interface)
-            WG_INTERFACE="$2"
-            shift 2
-            ;;
-        -p|--port)
-            WG_PORT="$2"
-            shift 2
-            ;;
-        -n|--network)
-            WG_NETWORK="$2"
-            shift 2
-            ;;
-        -s|--server-ip)
-            WG_SERVER_IP="$2"
-            shift 2
-            ;;
-        -d|--dns)
-            DNS_SERVERS="$2"
-            shift 2
-            ;;
-        -e|--external-interface)
-            EXTERNAL_INTERFACE="$2"
-            shift 2
-            ;;
-        -a|--server-address)
-            SERVER_PUBLIC_IP="$2"
-            shift 2
-            ;;
-        -f|--force)
-            FORCE=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            error_exit "Unknown option: $1"
-            ;;
+FORCE=0
+START=1
+while (($#)); do
+    case "$1" in
+        --force) FORCE=1; shift ;;
+        --no-start) START=0; shift ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "Unknown option: $1 (see --help)" ;;
     esac
 done
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    error_exit "This script must be run as root"
+require_root
+require_cmd wg flock
+
+[[ "$WG_INTERFACE" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] || die "Invalid WG_INTERFACE: $WG_INTERFACE"
+[[ "$WG_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && ((WG_PORT <= 65535)) || die "Invalid WG_PORT: $WG_PORT"
+validate_cidr "$VPN_SUBNET" || die "Invalid VPN_SUBNET: $VPN_SUBNET"
+ip_in_cidr "$VPN_SERVER_IP" "$VPN_SUBNET" || die "VPN_SERVER_IP $VPN_SERVER_IP is not inside $VPN_SUBNET"
+PREFIX="${VPN_SUBNET#*/}"
+((PREFIX <= 30)) || die "VPN_SUBNET $VPN_SUBNET is too small"
+
+ztvpn_lock wg
+
+# --------------------------------------------------------------------------
+# Server key pair
+# --------------------------------------------------------------------------
+(umask 077; mkdir -p "$WG_DIR" "$(dirname "$WG_SERVER_KEY")" "$(dirname "$WG_CONF")")
+chmod 700 "$WG_DIR"
+
+if [[ -s "$WG_SERVER_KEY" && "$FORCE" == 1 ]]; then
+    backup="$ZTVPN_BACKUP_DIR/wireguard-$(date +%Y%m%d-%H%M%S)"
+    (umask 077; mkdir -p "$backup")
+    cp -a "$WG_SERVER_KEY" "$backup/"
+    [[ -f "$WG_SERVER_PUBKEY" ]] && cp -a "$WG_SERVER_PUBKEY" "$backup/"
+    [[ -f "$WG_CONF" ]] && cp -a "$WG_CONF" "$backup/"
+    rm -f "$WG_SERVER_KEY"
+    warn "Old server keys backed up to $backup. All client configs must be re-issued."
 fi
 
-# Create log directory
-mkdir -p "$(dirname "$LOG_FILE")"
-
-log "Starting WireGuard setup with interface: $WG_INTERFACE, port: $WG_PORT, network: $WG_NETWORK"
-
-# Function to detect external interface
-detect_external_interface() {
-    if [[ -z "$EXTERNAL_INTERFACE" ]]; then
-        EXTERNAL_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-        if [[ -z "$EXTERNAL_INTERFACE" ]]; then
-            error_exit "Could not detect external network interface. Please specify with --external-interface"
-        fi
-        info "Detected external interface: $EXTERNAL_INTERFACE"
-    fi
-}
-
-# Function to detect server public IP
-detect_server_ip() {
-    if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-        # Try to detect public IP
-        SERVER_PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s ipinfo.io/ip 2>/dev/null || echo "")
-        if [[ -z "$SERVER_PUBLIC_IP" ]]; then
-            warning "Could not detect public IP. You'll need to set it manually in client configs."
-            SERVER_PUBLIC_IP="YOUR_SERVER_IP"
-        else
-            info "Detected public IP: $SERVER_PUBLIC_IP"
-        fi
-    fi
-}
-
-# Function to install WireGuard
-install_wireguard() {
-    info "Installing WireGuard..."
-    
-    # Detect OS and install accordingly
-    if command -v apt-get >/dev/null 2>&1; then
-        # Debian/Ubuntu
-        apt-get update
-        apt-get install -y wireguard wireguard-tools qrencode iptables-persistent
-    elif command -v yum >/dev/null 2>&1; then
-        # CentOS/RHEL
-        yum install -y epel-release
-        yum install -y wireguard-tools qrencode iptables-services
-    elif command -v dnf >/dev/null 2>&1; then
-        # Fedora
-        dnf install -y wireguard-tools qrencode iptables-services
-    else
-        error_exit "Unsupported operating system. Please install WireGuard manually."
-    fi
-    
-    success "WireGuard installed successfully"
-}
-
-# Function to generate server keys
-generate_server_keys() {
-    info "Generating WireGuard server keys..."
-    
-    local server_private_key_file="$CONFIG_DIR/${WG_INTERFACE}_private.key"
-    local server_public_key_file="$CONFIG_DIR/${WG_INTERFACE}_public.key"
-    
-    if [[ -f "$server_private_key_file" && "$FORCE" != "true" ]]; then
-        warning "Server keys already exist. Use --force to overwrite."
-        return 0
-    fi
-    
-    # Generate private key
-    wg genkey > "$server_private_key_file"
-    chmod 600 "$server_private_key_file"
-    
-    # Generate public key
-    wg pubkey < "$server_private_key_file" > "$server_public_key_file"
-    chmod 644 "$server_public_key_file"
-    
-    success "Server keys generated successfully"
-}
-
-# Function to create server configuration
-create_server_config() {
-    info "Creating WireGuard server configuration..."
-    
-    local config_file="$CONFIG_DIR/${WG_INTERFACE}.conf"
-    local private_key
-    private_key=$(cat "$CONFIG_DIR/${WG_INTERFACE}_private.key")
-    
-    if [[ -f "$config_file" && "$FORCE" != "true" ]]; then
-        warning "Configuration file already exists. Use --force to overwrite."
-        return 0
-    fi
-    
-    # Create configuration file
-    cat > "$config_file" << EOF
-# WireGuard Server Configuration
-# Generated on $(date)
-# Interface: $WG_INTERFACE
-# Network: $WG_NETWORK
-
-[Interface]
-# Server private key
-PrivateKey = $private_key
-
-# Server IP address within VPN network
-Address = $WG_SERVER_IP/$(echo $WG_NETWORK | cut -d'/' -f2)
-
-# Port to listen on
-ListenPort = $WG_PORT
-
-# DNS servers for clients
-DNS = $DNS_SERVERS
-
-# Post-up script to configure routing and firewall
-PostUp = iptables -A FORWARD -i %i -j ACCEPT
-PostUp = iptables -A FORWARD -o %i -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE
-PostUp = ip6tables -A FORWARD -i %i -j ACCEPT
-PostUp = ip6tables -A FORWARD -o %i -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE
-
-# Post-down script to clean up routing and firewall
-PostDown = iptables -D FORWARD -i %i -j ACCEPT
-PostDown = iptables -D FORWARD -o %i -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i %i -j ACCEPT
-PostDown = ip6tables -D FORWARD -o %i -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE
-
-# Security and performance settings
-SaveConfig = false
-
-# Client configurations will be added below
-# Each client gets a [Peer] section
-
-EOF
-    
-    chmod 600 "$config_file"
-    success "Server configuration created: $config_file"
-}
-
-# Function to configure firewall
-configure_firewall() {
-    info "Configuring firewall rules..."
-    
-    # Enable IP forwarding
-    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-    echo 'net.ipv6.conf.all.forwarding=1' >> /etc/sysctl.conf
-    sysctl -p
-    
-    # Configure iptables rules
-    iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
-    iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
-    iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
-    iptables -t nat -A POSTROUTING -o "$EXTERNAL_INTERFACE" -j MASQUERADE
-    
-    # Configure ip6tables rules
-    ip6tables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
-    ip6tables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
-    ip6tables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
-    ip6tables -t nat -A POSTROUTING -o "$EXTERNAL_INTERFACE" -j MASQUERADE
-    
-    # Save iptables rules
-    if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    fi
-    
-    # Configure UFW if present
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow "$WG_PORT"/udp
-        ufw --force enable
-    fi
-    
-    success "Firewall configured successfully"
-}
-
-# Function to create systemd service
-create_systemd_service() {
-    info "Configuring systemd service..."
-    
-    # Enable and start WireGuard service
-    systemctl enable wg-quick@"$WG_INTERFACE"
-    
-    # Create custom service file with additional security
-    cat > "/etc/systemd/system/wg-quick@${WG_INTERFACE}.service.d/override.conf" << EOF
-[Unit]
-Description=WireGuard via wg-quick(8) for %I
-After=network-online.target nss-lookup.target
-Wants=network-online.target nss-lookup.target
-PartOf=wg-quick.target
-Documentation=man:wg-quick(8)
-Documentation=man:wg(8)
-Documentation=https://www.wireguard.com/
-Documentation=https://www.wireguard.com/quickstart/
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/wg-quick up %I
-ExecStop=/usr/bin/wg-quick down %I
-ExecReload=/bin/bash -c 'exec /usr/bin/wg syncconf %I <(exec /usr/bin/wg-quick strip %I)'
-Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
-
-# Security settings
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/etc/wireguard
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    mkdir -p "/etc/systemd/system/wg-quick@${WG_INTERFACE}.service.d"
-    systemctl daemon-reload
-    
-    success "Systemd service configured"
-}
-
-# Function to create client directory structure
-create_client_structure() {
-    info "Creating client directory structure..."
-    
-    local client_dir="$CONFIG_DIR/clients"
-    mkdir -p "$client_dir"
-    chmod 700 "$client_dir"
-    
-    # Create client template
-    cat > "$client_dir/client-template.conf" << EOF
-# WireGuard Client Configuration Template
-# Replace placeholders with actual values
-
-[Interface]
-PrivateKey = CLIENT_PRIVATE_KEY
-Address = CLIENT_IP_ADDRESS/32
-DNS = $DNS_SERVERS
-
-[Peer]
-PublicKey = $(cat "$CONFIG_DIR/${WG_INTERFACE}_public.key")
-Endpoint = $SERVER_PUBLIC_IP:$WG_PORT
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
-    
-    success "Client directory structure created"
-}
-
-# Function to create management scripts
-create_management_scripts() {
-    info "Creating management scripts..."
-    
-    local scripts_dir="/usr/local/bin"
-    
-    # Create add-client script
-    cat > "$scripts_dir/wg-add-client" << 'EOF'
-#!/bin/bash
-# WireGuard client addition script
-
-set -euo pipefail
-
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <client-name> [client-ip]"
-    exit 1
-fi
-
-CLIENT_NAME="$1"
-WG_INTERFACE="wg0"
-CONFIG_DIR="/etc/wireguard"
-CLIENT_DIR="$CONFIG_DIR/clients"
-
-# Generate next available IP
-if [[ $# -lt 2 ]]; then
-    NETWORK=$(grep "Address" "$CONFIG_DIR/$WG_INTERFACE.conf" | cut -d'=' -f2 | xargs | cut -d'/' -f1)
-    SUBNET=$(echo "$NETWORK" | cut -d'.' -f1-3)
-    
-    # Find next available IP
-    for i in {2..254}; do
-        IP="$SUBNET.$i"
-        if ! grep -q "$IP" "$CONFIG_DIR/$WG_INTERFACE.conf"; then
-            CLIENT_IP="$IP"
-            break
-        fi
-    done
+if [[ ! -s "$WG_SERVER_KEY" ]]; then
+    (umask 077; wg genkey >"$WG_SERVER_KEY.tmp" && mv -f "$WG_SERVER_KEY.tmp" "$WG_SERVER_KEY")
+    success "Generated server private key $WG_SERVER_KEY"
 else
-    CLIENT_IP="$2"
+    info "Keeping existing server key $WG_SERVER_KEY"
+fi
+chmod 600 "$WG_SERVER_KEY"
+
+pubkey="$(wg pubkey <"$WG_SERVER_KEY")" || die "$WG_SERVER_KEY is not a valid WireGuard private key"
+if [[ ! -f "$WG_SERVER_PUBKEY" || "$(<"$WG_SERVER_PUBKEY")" != "$pubkey" ]]; then
+    printf '%s\n' "$pubkey" | atomic_write "$WG_SERVER_PUBKEY" 644
 fi
 
-# Generate client keys
-CLIENT_PRIVATE_KEY=$(wg genkey)
-CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVATE_KEY" | wg pubkey)
+# --------------------------------------------------------------------------
+# wg0.conf: regenerate [Interface], keep every peer
+# --------------------------------------------------------------------------
+peers=""
+old_address=""
+if [[ -f "$WG_CONF" ]]; then
+    old_address="$(awk -F'=' '/^[[:space:]]*\[Peer\]/ { exit } /^[[:space:]]*Address[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$WG_CONF")"
+    if grep -Eq '^[[:space:]]*(PostUp|PostDown|PreUp|PreDown|DNS)[[:space:]]*=' "$WG_CONF"; then
+        warn "Dropping PostUp/PostDown/DNS lines from $WG_CONF: forwarding and NAT are handled by nftables"
+    fi
+    # Everything from the first peer (managed "# BEGIN PEER" block or a
+    # hand-written [Peer]) to the end of the file is kept verbatim.
+    peers="$(awk '
+        /^# BEGIN PEER / || /^[[:space:]]*\[Peer\][[:space:]]*$/ { keep = 1 }
+        keep { print }
+    ' "$WG_CONF")"
+fi
 
-# Get server public key
-SERVER_PUBLIC_KEY=$(cat "$CONFIG_DIR/${WG_INTERFACE}_public.key")
-SERVER_ENDPOINT=$(grep "ListenPort" "$CONFIG_DIR/$WG_INTERFACE.conf" | cut -d'=' -f2 | xargs)
-
-# Create client config
-cat > "$CLIENT_DIR/$CLIENT_NAME.conf" << EOL
+new_conf="$(
+    cat <<EOF
+# Managed by scripts/setup/wireguard-setup.sh. The [Interface] section is
+# regenerated on every run; peers are added/removed by the management
+# scripts between "# BEGIN PEER" / "# END PEER" markers.
+# No PostUp/PostDown: forwarding and NAT live in nftables (table inet ztvpn).
 [Interface]
-PrivateKey = $CLIENT_PRIVATE_KEY
-Address = $CLIENT_IP/32
-DNS = 1.1.1.1, 1.0.0.1
-
-[Peer]
-PublicKey = $SERVER_PUBLIC_KEY
-Endpoint = YOUR_SERVER_IP:$SERVER_ENDPOINT
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOL
-
-# Add peer to server config
-cat >> "$CONFIG_DIR/$WG_INTERFACE.conf" << EOL
-
-# Client: $CLIENT_NAME
-[Peer]
-PublicKey = $CLIENT_PUBLIC_KEY
-AllowedIPs = $CLIENT_IP/32
-EOL
-
-# Generate QR code
-qrencode -t ansiutf8 < "$CLIENT_DIR/$CLIENT_NAME.conf"
-qrencode -o "$CLIENT_DIR/$CLIENT_NAME.png" < "$CLIENT_DIR/$CLIENT_NAME.conf"
-
-echo "Client $CLIENT_NAME added with IP $CLIENT_IP"
-echo "Configuration saved to: $CLIENT_DIR/$CLIENT_NAME.conf"
-echo "QR code saved to: $CLIENT_DIR/$CLIENT_NAME.png"
-echo "Restart WireGuard to apply changes: systemctl restart wg-quick@$WG_INTERFACE"
+Address = $VPN_SERVER_IP/$PREFIX
+ListenPort = $WG_PORT
+PrivateKey = $(<"$WG_SERVER_KEY")
 EOF
-    
-    chmod +x "$scripts_dir/wg-add-client"
-    
-    # Create remove-client script
-    cat > "$scripts_dir/wg-remove-client" << 'EOF'
-#!/bin/bash
-# WireGuard client removal script
+    if [[ -n "$peers" ]]; then
+        printf '\n%s\n' "$peers"
+    fi
+)"
 
-set -euo pipefail
+conf_changed=0
+if [[ ! -f "$WG_CONF" ]] || [[ "$(<"$WG_CONF")" != "$new_conf" ]]; then
+    printf '%s\n' "$new_conf" | atomic_write "$WG_CONF" 600
+    conf_changed=1
+    success "Wrote $WG_CONF ($(grep -c '^# BEGIN PEER ' "$WG_CONF" || true) managed peer(s) kept)"
+else
+    info "$WG_CONF is up to date"
+fi
+chmod 600 "$WG_CONF"
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <client-name>"
-    exit 1
+# --------------------------------------------------------------------------
+# Forwarding
+# --------------------------------------------------------------------------
+mkdir -p "$(dirname "$ZTVPN_SYSCTL_FILE")"
+atomic_write "$ZTVPN_SYSCTL_FILE" 644 <<'EOF'
+# Managed by scripts/setup/wireguard-setup.sh
+# Route between the WireGuard tunnel and the services network. What may be
+# forwarded is decided by nftables (table inet ztvpn), default drop.
+net.ipv4.ip_forward = 1
+# IPv6 forwarding is deliberately not enabled: the tunnel is IPv4 only
+# (VPN_SUBNET), and net.ipv6.conf.all.forwarding=1 would also stop the host
+# from accepting router advertisements on its uplink.
+EOF
+sysctl -p "$ZTVPN_SYSCTL_FILE" >&2 || die "Applying $ZTVPN_SYSCTL_FILE failed"
+
+# --------------------------------------------------------------------------
+# Service
+# --------------------------------------------------------------------------
+unit="wg-quick@$WG_INTERFACE"
+
+# Older versions of this project wrote a full unit into an override.conf,
+# which duplicates ExecStart and breaks the unit. Move it aside.
+legacy_override="$SYSTEMD_UNIT_DIR/$unit.service.d/override.conf"
+if [[ -f "$legacy_override" ]] && grep -q '^ExecStart=/usr/bin/wg-quick up' "$legacy_override"; then
+    (umask 077; mkdir -p "$ZTVPN_BACKUP_DIR")
+    mv "$legacy_override" "$ZTVPN_BACKUP_DIR/$unit-override.conf.$(date +%s)"
+    rmdir "$(dirname "$legacy_override")" 2>/dev/null || true
+    warn "Removed broken legacy $legacy_override"
+    ((START)) && systemctl daemon-reload
 fi
 
-CLIENT_NAME="$1"
-WG_INTERFACE="wg0"
-CONFIG_DIR="/etc/wireguard"
-CLIENT_DIR="$CONFIG_DIR/clients"
-
-# Remove client files
-rm -f "$CLIENT_DIR/$CLIENT_NAME.conf"
-rm -f "$CLIENT_DIR/$CLIENT_NAME.png"
-
-# Remove peer from server config
-sed -i "/# Client: $CLIENT_NAME/,/^$/d" "$CONFIG_DIR/$WG_INTERFACE.conf"
-
-echo "Client $CLIENT_NAME removed"
-echo "Restart WireGuard to apply changes: systemctl restart wg-quick@$WG_INTERFACE"
-EOF
-    
-    chmod +x "$scripts_dir/wg-remove-client"
-    
-    success "Management scripts created"
-}
-
-# Function to start WireGuard service
-start_wireguard() {
-    info "Starting WireGuard service..."
-    
-    # Start and enable the service
-    systemctl start wg-quick@"$WG_INTERFACE"
-    systemctl enable wg-quick@"$WG_INTERFACE"
-    
-    # Verify service is running
-    if systemctl is-active --quiet wg-quick@"$WG_INTERFACE"; then
-        success "WireGuard service started successfully"
+if ((START)); then
+    require_cmd systemctl
+    if systemctl is-active --quiet "$unit"; then
+        systemctl enable "$unit"
+        if ((conf_changed)); then
+            # wg-quick's ExecReload runs "wg syncconf" on the stripped config:
+            # peers and keys are updated without dropping sessions. An Address
+            # change still needs a restart.
+            systemctl reload "$unit"
+            success "Reloaded $unit"
+            if [[ -n "$old_address" && "$old_address" != "$VPN_SERVER_IP/$PREFIX" ]]; then
+                warn "Interface address changed ($old_address -> $VPN_SERVER_IP/$PREFIX): run 'systemctl restart $unit'"
+            fi
+        fi
     else
-        error_exit "Failed to start WireGuard service"
+        systemctl enable --now "$unit"
+        success "Enabled and started $unit"
     fi
-    
-    # Show interface status
-    info "WireGuard interface status:"
-    wg show "$WG_INTERFACE"
-}
-
-# Function to create monitoring configuration
-create_monitoring_config() {
-    info "Creating monitoring configuration..."
-    
-    # Create log rotation configuration
-    cat > "/etc/logrotate.d/wireguard" << EOF
-/var/log/zero-trust-vpn/*.log {
-    daily
-    missingok
-    rotate 30
-    compress
-    delaycompress
-    notifempty
-    create 644 root root
-    postrotate
-        systemctl reload rsyslog > /dev/null 2>&1 || true
-    endscript
-}
-EOF
-    
-    # Create monitoring script
-    cat > "/usr/local/bin/wg-monitor" << 'EOF'
-#!/bin/bash
-# WireGuard monitoring script
-
-WG_INTERFACE="wg0"
-LOG_FILE="/var/log/zero-trust-vpn/wireguard-monitor.log"
-
-# Check if interface is up
-if ! ip link show "$WG_INTERFACE" >/dev/null 2>&1; then
-    echo "$(date): WireGuard interface $WG_INTERFACE is down" >> "$LOG_FILE"
-    systemctl restart wg-quick@"$WG_INTERFACE"
+else
+    info "Not starting $unit (--no-start)"
 fi
 
-# Log connection statistics
-echo "$(date): $(wg show "$WG_INTERFACE" | grep -c peer) peers connected" >> "$LOG_FILE"
-EOF
-    
-    chmod +x "/usr/local/bin/wg-monitor"
-    
-    # Create cron job for monitoring
-    echo "*/5 * * * * root /usr/local/bin/wg-monitor" > /etc/cron.d/wireguard-monitor
-    
-    success "Monitoring configuration created"
-}
-
-# Function to display setup summary
-display_summary() {
-    echo
-    echo "============================================="
-    echo "WireGuard Setup Complete!"
-    echo "============================================="
-    echo
-    echo "Configuration Details:"
-    echo "  Interface: $WG_INTERFACE"
-    echo "  Port: $WG_PORT"
-    echo "  Network: $WG_NETWORK"
-    echo "  Server IP: $WG_SERVER_IP"
-    echo "  Public IP: $SERVER_PUBLIC_IP"
-    echo "  DNS Servers: $DNS_SERVERS"
-    echo
-    echo "Files Created:"
-    echo "  Server Config: $CONFIG_DIR/${WG_INTERFACE}.conf"
-    echo "  Private Key: $CONFIG_DIR/${WG_INTERFACE}_private.key"
-    echo "  Public Key: $CONFIG_DIR/${WG_INTERFACE}_public.key"
-    echo "  Client Directory: $CONFIG_DIR/clients/"
-    echo
-    echo "Management Commands:"
-    echo "  Add Client: wg-add-client <name> [ip]"
-    echo "  Remove Client: wg-remove-client <name>"
-    echo "  Show Status: wg show $WG_INTERFACE"
-    echo "  Restart Service: systemctl restart wg-quick@$WG_INTERFACE"
-    echo
-    echo "Next Steps:"
-    echo "1. Update SERVER_PUBLIC_IP in client configurations"
-    echo "2. Add clients using: wg-add-client <client-name>"
-    echo "3. Configure firewall rules if needed"
-    echo "4. Set up monitoring and alerting"
-    echo
-    echo "Security Recommendations:"
-    echo "- Regularly rotate server keys"
-    echo "- Monitor connection logs"
-    echo "- Use certificate-based authentication"
-    echo "- Implement network segmentation"
-    echo
-}
-
-# Main execution
-main() {
-    echo "Zero Trust VPN - WireGuard Setup"
-    echo "================================="
-    echo
-    
-    # Detect network configuration
-    detect_external_interface
-    detect_server_ip
-    
-    # Install WireGuard
-    if ! command -v wg >/dev/null 2>&1; then
-        install_wireguard
-    else
-        info "WireGuard already installed"
-    fi
-    
-    # Create configuration directory
-    mkdir -p "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR"
-    
-    # Generate keys and configuration
-    generate_server_keys
-    create_server_config
-    
-    # Configure system
-    configure_firewall
-    create_systemd_service
-    create_client_structure
-    create_management_scripts
-    create_monitoring_config
-    
-    # Start service
-    start_wireguard
-    
-    # Display summary
-    display_summary
-    
-    log "WireGuard setup completed successfully"
-}
-
-# Run main function
-main "$@"
+info "Server public key: $pubkey"
+info "Clients connect to $VPN_ENDPOINT:$WG_PORT"

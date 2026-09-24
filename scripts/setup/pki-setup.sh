@@ -1,612 +1,179 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Creates the internal CA, the server certificate and the CRL.
+#
+# Safe to re-run: an existing CA is never touched (use --force to replace
+# it, the old one is backed up first), the server certificate is only
+# re-issued when it is missing, no longer verifies, expires within
+# PKI_RENEW_DAYS or its SAN list changed. Client certificates are issued by
+# scripts/management/add-user.sh and renewed by
+# scripts/automation/cert-renewal.sh, not here.
 
-# PKI Infrastructure Setup Script for Zero Trust VPN
-# Creates and manages Certificate Authority and certificates
+set -Eeuo pipefail
 
-set -euo pipefail
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+PKI_RENEW_DAYS="${PKI_RENEW_DAYS:-30}"
+# Extra server certificate SANs kept across runs (comma separated).
+PKI_SERVER_SANS="${PKI_SERVER_SANS:-}"
+LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/pki-setup.log}"
 
-# Source environment variables
-if [[ -f "$PROJECT_ROOT/.env" ]]; then
-    source "$PROJECT_ROOT/.env"
-else
-    echo "Warning: .env file not found"
-fi
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
 
-# Default values
-CERTS_PATH="${CERTS_PATH:-/opt/zero-trust-vpn/certificates}"
-CA_VALIDITY_DAYS="${CA_VALIDITY_DAYS:-3650}"
-CERT_VALIDITY_DAYS="${CERT_VALIDITY_DAYS:-365}"
-KEY_SIZE="${KEY_SIZE:-2048}"
+Initialise the zero-trust-vpn PKI under $PKI_DIR.
 
-# Certificate details
-CA_COUNTRY="${CA_COUNTRY:-US}"
-CA_STATE="${CA_STATE:-State}"
-CA_CITY="${CA_CITY:-City}"
-CA_ORG="${CA_ORG:-Zero Trust VPN}"
-CA_OU="${CA_OU:-Certificate Authority}"
-CA_CN="${CA_CN:-Zero Trust VPN CA}"
+  - creates the CA (key encrypted with $PKI_CA_PASSFILE) if none exists
+  - issues/renews the server certificate for AUTH_DOMAIN ($AUTH_DOMAIN)
+    with VPN_ENDPOINT ($VPN_ENDPOINT), PKI_SERVER_SANS and --san values as SANs
+  - regenerates the CRL
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+Options:
+  --san NAME        Extra DNS name or IPv4 address for the server cert (repeatable).
+                    Not persisted: add permanent ones to PKI_SERVER_SANS.
+  --reissue         Re-issue the server certificate even if it is still valid
+  --force           Replace an existing CA. The old CA, certificates, CRL and
+                    passphrase are moved to $ZTVPN_BACKUP_DIR first. Every
+                    certificate signed by the old CA stops verifying.
+  --write-config    Only regenerate $PKI_CA_CNF from the PKI_* settings
+  -h, --help        Show this help
 
-# Logging functions
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-# Check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root for certificate management"
-        exit 1
-    fi
-}
-
-# Create PKI directory structure
-create_pki_structure() {
-    log "Creating PKI directory structure..."
-    
-    mkdir -p "$CERTS_PATH"/{ca,server,clients,crl,private}
-    mkdir -p "$CERTS_PATH"/ca/{certs,crl,newcerts,private}
-    
-    # Set secure permissions
-    chmod 700 "$CERTS_PATH"
-    chmod 700 "$CERTS_PATH"/ca/private
-    chmod 700 "$CERTS_PATH"/private
-    
-    # Create index and serial files for CA
-    touch "$CERTS_PATH/ca/index.txt"
-    echo 1000 > "$CERTS_PATH/ca/serial"
-    echo 1000 > "$CERTS_PATH/ca/crlnumber"
-    
-    log "✓ PKI directory structure created"
-}
-
-# Create OpenSSL configuration for CA
-create_ca_config() {
-    log "Creating CA configuration..."
-    
-    cat > "$CERTS_PATH/ca/openssl.cnf" << EOF
-# OpenSSL CA configuration file
-
-[ ca ]
-default_ca = CA_default
-
-[ CA_default ]
-dir               = $CERTS_PATH/ca
-certs             = \$dir/certs
-crl_dir           = \$dir/crl
-new_certs_dir     = \$dir/newcerts
-database          = \$dir/index.txt
-serial            = \$dir/serial
-RANDFILE          = \$dir/private/.rand
-
-private_key       = \$dir/private/ca.key
-certificate       = \$dir/ca.crt
-
-crlnumber         = \$dir/crlnumber
-crl               = \$dir/crl/ca.crl
-crl_extensions    = crl_ext
-default_crl_days  = 30
-
-default_md        = sha256
-name_opt          = ca_default
-cert_opt          = ca_default
-default_days      = $CERT_VALIDITY_DAYS
-preserve          = no
-policy            = policy_strict
-
-[ policy_strict ]
-countryName             = match
-stateOrProvinceName     = match
-organizationName        = match
-organizationalUnitName  = optional
-commonName              = supplied
-emailAddress            = optional
-
-[ policy_loose ]
-countryName             = optional
-stateOrProvinceName     = optional
-localityName            = optional
-organizationName        = optional
-organizationalUnitName  = optional
-commonName              = supplied
-emailAddress            = optional
-
-[ req ]
-default_bits        = $KEY_SIZE
-distinguished_name  = req_distinguished_name
-string_mask         = utf8only
-default_md          = sha256
-x509_extensions     = v3_ca
-
-[ req_distinguished_name ]
-countryName                     = Country Name (2 letter code)
-stateOrProvinceName             = State or Province Name
-localityName                    = Locality Name
-0.organizationName              = Organization Name
-organizationalUnitName          = Organizational Unit Name
-commonName                      = Common Name
-emailAddress                    = Email Address
-
-countryName_default             = $CA_COUNTRY
-stateOrProvinceName_default     = $CA_STATE
-localityName_default            = $CA_CITY
-0.organizationName_default      = $CA_ORG
-organizationalUnitName_default  = $CA_OU
-emailAddress_default            = admin@example.com
-
-[ v3_ca ]
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
-basicConstraints = critical, CA:true
-keyUsage = critical, digitalSignature, cRLSign, keyCertSign
-
-[ v3_intermediate_ca ]
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
-basicConstraints = critical, CA:true, pathlen:0
-keyUsage = critical, digitalSignature, cRLSign, keyCertSign
-
-[ usr_cert ]
-basicConstraints = CA:FALSE
-nsCertType = client, email
-nsComment = "OpenSSL Generated Client Certificate"
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
-extendedKeyUsage = clientAuth, emailProtection
-
-[ server_cert ]
-basicConstraints = CA:FALSE
-nsCertType = server
-nsComment = "OpenSSL Generated Server Certificate"
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer:always
-keyUsage = critical, digitalSignature, keyEncipherment
-extendedKeyUsage = serverAuth
-
-[ crl_ext ]
-authorityKeyIdentifier=keyid:always
-
-[ ocsp ]
-basicConstraints = CA:FALSE
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-keyUsage = critical, digitalSignature
-extendedKeyUsage = critical, OCSPSigning
+Settings (ztvpn.conf or environment): PKI_ORG, PKI_COUNTRY, PKI_CA_DAYS,
+PKI_CERT_DAYS, PKI_CA_KEY_ALG, PKI_KEY_ALG, PKI_CRL_URL, PKI_RENEW_DAYS,
+PKI_SERVER_SANS.
 EOF
-    
-    log "✓ CA configuration created"
 }
 
-# Create Certificate Authority
-create_ca() {
-    log "Creating Certificate Authority..."
-    
-    # Generate CA private key
-    openssl genrsa -out "$CERTS_PATH/ca/private/ca.key" $KEY_SIZE
-    chmod 400 "$CERTS_PATH/ca/private/ca.key"
-    
-    # Generate CA certificate
-    openssl req -config "$CERTS_PATH/ca/openssl.cnf" \
-        -key "$CERTS_PATH/ca/private/ca.key" \
-        -new -x509 -days $CA_VALIDITY_DAYS -sha256 -extensions v3_ca \
-        -out "$CERTS_PATH/ca/ca.crt" \
-        -subj "/C=$CA_COUNTRY/ST=$CA_STATE/L=$CA_CITY/O=$CA_ORG/OU=$CA_OU/CN=$CA_CN"
-    
-    chmod 444 "$CERTS_PATH/ca/ca.crt"
-    
-    log "✓ Certificate Authority created"
-    log "  CA Certificate: $CERTS_PATH/ca/ca.crt"
-    log "  CA Private Key: $CERTS_PATH/ca/private/ca.key"
+# DNS name (optionally wildcard) or IPv4 address.
+validate_san() {
+    validate_ipv4 "$1" && return 0
+    [[ ${#1} -le 253 && "$1" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
 
-# Create server certificate
-create_server_certificate() {
-    local domain="${DOMAIN:-vpn.example.com}"
-    
-    log "Creating server certificate for $domain..."
-    
-    # Generate server private key
-    openssl genrsa -out "$CERTS_PATH/server/server.key" $KEY_SIZE
-    chmod 400 "$CERTS_PATH/server/server.key"
-    
-    # Create certificate signing request
-    openssl req -config "$CERTS_PATH/ca/openssl.cnf" \
-        -key "$CERTS_PATH/server/server.key" \
-        -new -sha256 -out "$CERTS_PATH/server/server.csr" \
-        -subj "/C=$CA_COUNTRY/ST=$CA_STATE/L=$CA_CITY/O=$CA_ORG/OU=VPN Server/CN=$domain"
-    
-    # Create server certificate extensions
-    cat > "$CERTS_PATH/server/server_ext.cnf" << EOF
-authorityKeyIdentifier=keyid,issuer:always
-basicConstraints=CA:FALSE
-keyUsage=keyEncipherment,dataEncipherment
-subjectAltName=@alt_names
+FORCE=0
+REISSUE=0
+WRITE_CONFIG_ONLY=0
+EXTRA_SANS=()
 
-[alt_names]
-DNS.1=$domain
-DNS.2=auth.$domain
-DNS.3=*.vpn.$domain
-IP.1=127.0.0.1
-EOF
-    
-    # Sign server certificate
-    openssl ca -config "$CERTS_PATH/ca/openssl.cnf" \
-        -extensions server_cert -days $CERT_VALIDITY_DAYS -notext -md sha256 \
-        -in "$CERTS_PATH/server/server.csr" \
-        -out "$CERTS_PATH/server/server.crt" \
-        -extfile "$CERTS_PATH/server/server_ext.cnf" \
-        -batch
-    
-    chmod 444 "$CERTS_PATH/server/server.crt"
-    
-    # Clean up CSR
-    rm "$CERTS_PATH/server/server.csr"
-    
-    log "✓ Server certificate created"
-    log "  Server Certificate: $CERTS_PATH/server/server.crt"
-    log "  Server Private Key: $CERTS_PATH/server/server.key"
-}
+while (($#)); do
+    case "$1" in
+        --san)
+            [[ $# -ge 2 ]] || die "--san needs a value"
+            EXTRA_SANS+=("$2")
+            shift 2
+            ;;
+        --reissue) REISSUE=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --write-config) WRITE_CONFIG_ONLY=1; shift ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "Unknown option: $1 (see --help)" ;;
+    esac
+done
 
-# Create client certificate template
-create_client_cert_template() {
-    log "Creating client certificate template..."
-    
-    cat > "$CERTS_PATH/create_client_cert.sh" << 'EOF'
-#!/bin/bash
+require_root
+require_cmd openssl flock
 
-# Client Certificate Creation Script
+while IFS= read -r s; do EXTRA_SANS+=("$s"); done < <(split_csv "$PKI_SERVER_SANS")
 
-set -euo pipefail
+SERVER_NAME="$AUTH_DOMAIN"
+validate_san "$SERVER_NAME" && ! validate_ipv4 "$SERVER_NAME" && [[ "$SERVER_NAME" != \** ]] ||
+    die "AUTH_DOMAIN must be a DNS name: $SERVER_NAME"
+validate_san "$VPN_ENDPOINT" || die "Invalid VPN_ENDPOINT: $VPN_ENDPOINT"
+for s in "${EXTRA_SANS[@]}"; do
+    validate_san "$s" || die "Invalid SAN (--san/PKI_SERVER_SANS): $s"
+done
+for v in PKI_CA_DAYS PKI_CERT_DAYS PKI_RENEW_DAYS; do
+    [[ "${!v}" =~ ^[1-9][0-9]{0,4}$ ]] || die "Invalid $v: ${!v}"
+done
+[[ "$PKI_ORG" =~ ^[A-Za-z0-9\ .,\&()\'-]{1,64}$ ]] || die "Invalid PKI_ORG: $PKI_ORG"
+[[ -z "$PKI_COUNTRY" || "$PKI_COUNTRY" =~ ^[A-Z]{2}$ ]] || die "PKI_COUNTRY must be a two-letter code"
+[[ -z "$PKI_CRL_URL" || "$PKI_CRL_URL" =~ ^https?://[A-Za-z0-9._~:/?#@!\&\'()*+,\;=%-]+$ ]] ||
+    die "Invalid PKI_CRL_URL: $PKI_CRL_URL"
 
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <username> <email>"
-    exit 1
+ztvpn_lock pki
+
+if ((WRITE_CONFIG_ONLY)); then
+    [[ -d "$PKI_CA_DIR" ]] || die "No CA directory at $PKI_CA_DIR; run without --write-config first"
+    pki_write_ca_config
+    success "Rewrote $PKI_CA_CNF"
+    exit 0
 fi
 
-USERNAME="$1"
-EMAIL="$2"
-CERTS_PATH="$(dirname "$0")"
-KEY_SIZE=2048
-
-# Generate client private key
-openssl genrsa -out "$CERTS_PATH/clients/${USERNAME}.key" $KEY_SIZE
-chmod 400 "$CERTS_PATH/clients/${USERNAME}.key"
-
-# Create certificate signing request
-openssl req -config "$CERTS_PATH/ca/openssl.cnf" \
-    -key "$CERTS_PATH/clients/${USERNAME}.key" \
-    -new -sha256 -out "$CERTS_PATH/clients/${USERNAME}.csr" \
-    -subj "/C=US/ST=State/L=City/O=Zero Trust VPN/OU=VPN Users/CN=${USERNAME}/emailAddress=${EMAIL}"
-
-# Sign client certificate
-openssl ca -config "$CERTS_PATH/ca/openssl.cnf" \
-    -extensions usr_cert -days 365 -notext -md sha256 \
-    -in "$CERTS_PATH/clients/${USERNAME}.csr" \
-    -out "$CERTS_PATH/clients/${USERNAME}.crt" \
-    -batch
-
-chmod 444 "$CERTS_PATH/clients/${USERNAME}.crt"
-
-# Clean up CSR
-rm "$CERTS_PATH/clients/${USERNAME}.csr"
-
-# Create PKCS#12 bundle for easy import
-openssl pkcs12 -export \
-    -out "$CERTS_PATH/clients/${USERNAME}.p12" \
-    -inkey "$CERTS_PATH/clients/${USERNAME}.key" \
-    -in "$CERTS_PATH/clients/${USERNAME}.crt" \
-    -certfile "$CERTS_PATH/ca/ca.crt" \
-    -passout pass:
-
-echo "Client certificate created for $USERNAME"
-echo "Certificate: $CERTS_PATH/clients/${USERNAME}.crt"
-echo "Private Key: $CERTS_PATH/clients/${USERNAME}.key"
-echo "PKCS#12 Bundle: $CERTS_PATH/clients/${USERNAME}.p12"
-EOF
-    
-    chmod +x "$CERTS_PATH/create_client_cert.sh"
-    
-    log "✓ Client certificate template created"
-}
-
-# Create certificate revocation list
-create_crl() {
-    log "Creating Certificate Revocation List..."
-    
-    openssl ca -config "$CERTS_PATH/ca/openssl.cnf" \
-        -gencrl -out "$CERTS_PATH/crl/ca.crl"
-    
-    chmod 444 "$CERTS_PATH/crl/ca.crl"
-    
-    log "✓ Certificate Revocation List created"
-}
-
-# Create certificate management scripts
-create_management_scripts() {
-    log "Creating certificate management scripts..."
-    
-    # Certificate verification script
-    cat > "$CERTS_PATH/verify_cert.sh" << 'EOF'
-#!/bin/bash
-
-# Certificate Verification Script
-
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <certificate_file>"
-    exit 1
-fi
-
-CERT_FILE="$1"
-CA_CERT="$(dirname "$0")/ca/ca.crt"
-
-echo "=== Certificate Information ==="
-openssl x509 -in "$CERT_FILE" -text -noout
-
-echo -e "\n=== Certificate Verification ==="
-if openssl verify -CAfile "$CA_CERT" "$CERT_FILE"; then
-    echo "✓ Certificate is valid"
-else
-    echo "✗ Certificate verification failed"
-fi
-
-echo -e "\n=== Certificate Expiration ==="
-openssl x509 -in "$CERT_FILE" -noout -dates
-EOF
-    
-    chmod +x "$CERTS_PATH/verify_cert.sh"
-    
-    # Certificate revocation script
-    cat > "$CERTS_PATH/revoke_cert.sh" << 'EOF'
-#!/bin/bash
-
-# Certificate Revocation Script
-
-set -euo pipefail
-
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <certificate_file>"
-    exit 1
-fi
-
-CERT_FILE="$1"
-CERTS_PATH="$(dirname "$0")"
-
-echo "Revoking certificate: $CERT_FILE"
-
-# Revoke certificate
-openssl ca -config "$CERTS_PATH/ca/openssl.cnf" \
-    -revoke "$CERT_FILE"
-
-# Update CRL
-openssl ca -config "$CERTS_PATH/ca/openssl.cnf" \
-    -gencrl -out "$CERTS_PATH/crl/ca.crl"
-
-echo "Certificate revoked and CRL updated"
-EOF
-    
-    chmod +x "$CERTS_PATH/revoke_cert.sh"
-    
-    # Certificate renewal script
-    cat > "$CERTS_PATH/renew_cert.sh" << 'EOF'
-#!/bin/bash
-
-# Certificate Renewal Script
-
-set -euo pipefail
-
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <username> <email>"
-    exit 1
-fi
-
-USERNAME="$1"
-EMAIL="$2"
-CERTS_PATH="$(dirname "$0")"
-
-# Backup old certificate
-if [[ -f "$CERTS_PATH/clients/${USERNAME}.crt" ]]; then
-    mv "$CERTS_PATH/clients/${USERNAME}.crt" "$CERTS_PATH/clients/${USERNAME}.crt.old"
-    mv "$CERTS_PATH/clients/${USERNAME}.key" "$CERTS_PATH/clients/${USERNAME}.key.old"
-fi
-
-# Create new certificate
-"$CERTS_PATH/create_client_cert.sh" "$USERNAME" "$EMAIL"
-
-echo "Certificate renewed for $USERNAME"
-EOF
-    
-    chmod +x "$CERTS_PATH/renew_cert.sh"
-    
-    log "✓ Certificate management scripts created"
-}
-
-# Create certificate monitoring script
-create_monitoring_script() {
-    log "Creating certificate monitoring script..."
-    
-    cat > "$CERTS_PATH/monitor_certs.sh" << 'EOF'
-#!/bin/bash
-
-# Certificate Monitoring Script
-
-CERTS_PATH="$(dirname "$0")"
-WARNING_DAYS=30
-CRITICAL_DAYS=7
-
-check_cert_expiry() {
-    local cert_file="$1"
-    local cert_name="$2"
-    
-    if [[ ! -f "$cert_file" ]]; then
-        echo "Certificate not found: $cert_file"
-        return 1
-    fi
-    
-    local expiry_date=$(openssl x509 -in "$cert_file" -noout -enddate | cut -d= -f2)
-    local expiry_epoch=$(date -d "$expiry_date" +%s)
-    local current_epoch=$(date +%s)
-    local days_until_expiry=$(( (expiry_epoch - current_epoch) / 86400 ))
-    
-    echo -n "$cert_name: "
-    
-    if [[ $days_until_expiry -lt $CRITICAL_DAYS ]]; then
-        echo "CRITICAL - Expires in $days_until_expiry days"
-        return 2
-    elif [[ $days_until_expiry -lt $WARNING_DAYS ]]; then
-        echo "WARNING - Expires in $days_until_expiry days"
-        return 1
-    else
-        echo "OK - Expires in $days_until_expiry days"
-        return 0
-    fi
-}
-
-echo "=== Certificate Expiry Monitor ==="
-echo "Date: $(date)"
-echo
-
-# Check CA certificate
-check_cert_expiry "$CERTS_PATH/ca/ca.crt" "CA Certificate"
-
-# Check server certificate
-check_cert_expiry "$CERTS_PATH/server/server.crt" "Server Certificate"
-
-# Check client certificates
-if [[ -d "$CERTS_PATH/clients" ]]; then
-    for cert in "$CERTS_PATH/clients"/*.crt; do
-        if [[ -f "$cert" ]]; then
-            local basename=$(basename "$cert" .crt)
-            check_cert_expiry "$cert" "Client Certificate ($basename)"
-        fi
+# Moves the whole PKI (and its passphrase) into a timestamped backup dir.
+backup_pki() {
+    local dest d
+    dest="$ZTVPN_BACKUP_DIR/pki-$(date +%Y%m%d-%H%M%S)"
+    (umask 077; mkdir -p "$dest")
+    for d in "$PKI_CA_DIR" "$PKI_SERVER_DIR" "$PKI_CLIENTS_DIR" "$(dirname "$PKI_CRL")"; do
+        [[ -e "$d" ]] && mv "$d" "$dest/"
     done
+    [[ -e "$PKI_CA_PASSFILE" ]] && mv "$PKI_CA_PASSFILE" "$dest/"
+    chmod -R go-rwx "$dest"
+    warn "Old PKI moved to $dest"
+}
+
+if ((FORCE)) && [[ -e "$PKI_CA_KEY" || -e "$PKI_CA_CERT" ]]; then
+    warn "Replacing the existing CA. All issued certificates must be re-issued."
+    backup_pki
+    pki_init_ca
+    success "Created new CA $PKI_CA_CERT"
+elif pki_ca_exists; then
+    info "CA already exists at $PKI_CA_DIR, keeping it (use --force to replace)"
+elif [[ -e "$PKI_CA_KEY" || -e "$PKI_CA_CERT" ]]; then
+    die "Incomplete CA in $PKI_CA_DIR (only one of ca.crt/ca.key present); fix it or use --force"
+else
+    pki_init_ca
+    success "Created CA $PKI_CA_CERT"
 fi
 
-echo
-echo "=== End of Report ==="
-EOF
-    
-    chmod +x "$CERTS_PATH/monitor_certs.sh"
-    
-    log "✓ Certificate monitoring script created"
+# Desired SAN set, normalised to "DNS:x" / "IP:x", sorted and de-duplicated.
+desired_sans() {
+    local s
+    {
+        printf 'DNS:%s\n' "$SERVER_NAME"
+        for s in "$VPN_ENDPOINT" "${EXTRA_SANS[@]}"; do
+            if validate_ipv4 "$s"; then printf 'IP:%s\n' "$s"; else printf 'DNS:%s\n' "$s"; fi
+        done
+    } | sort -u
 }
 
-# Set proper permissions
-set_permissions() {
-    log "Setting proper permissions..."
-    
-    # Set ownership
-    chown -R root:root "$CERTS_PATH"
-    
-    # Set directory permissions
-    find "$CERTS_PATH" -type d -exec chmod 755 {} \;
-    
-    # Set private key permissions
-    find "$CERTS_PATH" -name "*.key" -exec chmod 400 {} \;
-    
-    # Set certificate permissions
-    find "$CERTS_PATH" -name "*.crt" -exec chmod 444 {} \;
-    
-    # Set script permissions
-    find "$CERTS_PATH" -name "*.sh" -exec chmod 755 {} \;
-    
-    # Secure private directories
-    chmod 700 "$CERTS_PATH/ca/private"
-    chmod 700 "$CERTS_PATH/private"
-    
-    log "✓ Permissions set securely"
+current_sans() {
+    openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null |
+        tail -n +2 | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/^IP Address:/IP:/' | grep -v '^$' | sort -u
 }
 
-# Display PKI information
-display_pki_info() {
-    log "PKI setup completed successfully!"
-    echo ""
-    echo "PKI Structure:"
-    echo "=============="
-    echo "Root Directory: $CERTS_PATH"
-    echo "CA Certificate: $CERTS_PATH/ca/ca.crt"
-    echo "Server Certificate: $CERTS_PATH/server/server.crt"
-    echo "CRL: $CERTS_PATH/crl/ca.crl"
-    echo ""
-    echo "Management Scripts:"
-    echo "=================="
-    echo "Create client cert: $CERTS_PATH/create_client_cert.sh <username> <email>"
-    echo "Verify certificate: $CERTS_PATH/verify_cert.sh <cert_file>"
-    echo "Revoke certificate: $CERTS_PATH/revoke_cert.sh <cert_file>"
-    echo "Renew certificate: $CERTS_PATH/renew_cert.sh <username> <email>"
-    echo "Monitor certificates: $CERTS_PATH/monitor_certs.sh"
-    echo ""
-    echo "Certificate Information:"
-    echo "======================="
-    openssl x509 -in "$CERTS_PATH/ca/ca.crt" -noout -subject -issuer -dates
-    echo ""
-    echo "Next Steps:"
-    echo "==========="
-    echo "1. Distribute CA certificate to clients"
-    echo "2. Create client certificates as needed"
-    echo "3. Configure certificate monitoring"
-    echo "4. Set up certificate renewal automation"
-}
+server_crt="$PKI_SERVER_DIR/$SERVER_NAME.crt"
+reason=""
+if ((REISSUE)); then
+    reason="--reissue given"
+elif [[ ! -f "$server_crt" || ! -f "$PKI_SERVER_DIR/$SERVER_NAME.key" ]]; then
+    reason="no server certificate yet"
+elif ! pki_verify "$server_crt"; then
+    reason="certificate does not verify against the current CA/CRL"
+elif (($(pki_days_left "$server_crt") < PKI_RENEW_DAYS)); then
+    reason="certificate expires within $PKI_RENEW_DAYS days"
+elif [[ -n "$(comm -23 <(desired_sans) <(current_sans "$server_crt"))" ]]; then
+    # Only missing names trigger a re-issue, so a plain re-run never drops
+    # SANs that an earlier --san added.
+    reason="SAN list changed"
+fi
 
-# Main function
-main() {
-    log "Starting PKI infrastructure setup..."
-    
-    check_root
-    create_pki_structure
-    create_ca_config
-    create_ca
-    create_server_certificate
-    create_client_cert_template
-    create_crl
-    create_management_scripts
-    create_monitoring_script
-    set_permissions
-    
-    display_pki_info
-    
-    log "PKI infrastructure setup completed successfully!"
-}
+if [[ -n "$reason" ]]; then
+    info "Issuing server certificate for $SERVER_NAME ($reason)"
+    sans=()
+    declare -A seen=(["$SERVER_NAME"]=1)
+    for s in "$VPN_ENDPOINT" "${EXTRA_SANS[@]}"; do
+        [[ -n "${seen[$s]:-}" ]] && continue
+        seen["$s"]=1
+        sans+=("$s")
+    done
+    crt="$(pki_issue server "$SERVER_NAME" "$PKI_CERT_DAYS" "${sans[@]}")" || die "Issuing the server certificate failed"
+    success "Server certificate: $crt (key $PKI_SERVER_DIR/$SERVER_NAME.key)"
+else
+    info "Server certificate $server_crt is current ($(pki_days_left "$server_crt") days left)"
+fi
 
-# Handle script arguments
-case "${1:-}" in
-    --help|-h)
-        echo "Usage: $0 [options]"
-        echo ""
-        echo "Options:"
-        echo "  --help, -h     Show this help message"
-        echo ""
-        echo "Environment variables:"
-        echo "  CERTS_PATH           Certificate directory path"
-        echo "  CA_VALIDITY_DAYS     CA certificate validity (default: 3650)"
-        echo "  CERT_VALIDITY_DAYS   Certificate validity (default: 365)"
-        echo "  KEY_SIZE            RSA key size (default: 2048)"
-        echo ""
-        exit 0
-        ;;
-    *)
-        main
-        ;;
-esac
+pki_gen_crl || die "CRL generation failed"
+success "CRL refreshed: $PKI_CRL"
+info "CA certificate for clients: $PKI_CA_CERT"
