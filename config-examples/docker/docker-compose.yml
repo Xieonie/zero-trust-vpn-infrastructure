@@ -13,6 +13,7 @@
 #   ${AUTHELIA_SECRETS_DIR}/<secret>                        -> /secrets (ro)
 #   ${CONFIG_PATH}/nginx/templates/*.template, snippets/    -> nginx
 #   ${CERTS_PATH}/server/${AUTH_DOMAIN}.{crt,key}          -> nginx TLS
+#   ${CERTS_PATH}/ca/ca.crt, ${CERTS_PATH}/crl/            -> nginx client certs (MTLS)
 #
 # Optional profile "monitoring" (docker compose --profile monitoring up -d)
 # additionally needs, provided by you:
@@ -148,6 +149,14 @@ services:
       - ${CONFIG_PATH}/nginx/snippets:/etc/nginx/snippets:ro
       # Only the server certificates; the CA key and client keys stay out.
       - ${CERTS_PATH:?set CERTS_PATH in .env}/server:/etc/nginx/certs:ro
+      # Client certificate checks (MTLS=yes, snippets/mtls.conf): the CA
+      # certificate as a single file, never the ca/ directory (it holds
+      # private/ca.key), and the CRL directory, because the CRL is replaced
+      # atomically (new inode) and nginx re-reads it on reload.
+      # Single-file mount: after replacing the CA (pki-setup.sh --force) run
+      # "docker compose up -d --force-recreate nginx" so the new file is seen.
+      - ${CERTS_PATH}/ca/ca.crt:/etc/nginx/client-ca/ca.crt:ro
+      - ${CERTS_PATH}/crl:/etc/nginx/crl:ro
     networks:
       - frontend
     depends_on:

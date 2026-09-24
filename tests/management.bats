@@ -230,6 +230,111 @@ EOF
     ! grep -q PrivateKey "$CALLS"
 }
 
+# Records every openssl invocation (argv) in $CALLS, then runs the real one.
+record_openssl() {
+    REAL_OPENSSL="$(command -v openssl)"
+    export REAL_OPENSSL
+    stub openssl 'exec "$REAL_OPENSSL" "$@"'
+}
+
+# Value of "<label>: value" in an onboarding file.
+onboarding_field() {
+    sed -n "s/^$2: *//p" "$1"
+}
+
+@test "add-user: --cert writes a 0600 .p12 whose password is only in the onboarding file" {
+    with_ca
+    record_openssl
+    run "$ADD" erin erin@example.com --cert
+    [ "$status" -eq 0 ]
+    p12="$(sed -n 's/^p12=//p' <<<"$output")"
+    onboarding="$(sed -n 's/^onboarding=//p' <<<"$output")"
+    [ "$p12" = "$PKI_CLIENTS_DIR/erin.p12" ]
+    [ "$(stat -c %a "$p12")" = "600" ]
+    [ "$(onboarding_field "$onboarding" 'Certificate bundle')" = "$p12" ]
+    pw="$(onboarding_field "$onboarding" 'Bundle password')"
+    [ "${#pw}" -eq 24 ]
+    printf '%s\n' "$pw" >"$BATS_TEST_TMPDIR/pw"
+    # The bundle opens with that password and holds the key, the client cert and the CA.
+    "$REAL_OPENSSL" pkcs12 -in "$p12" -passin "file:$BATS_TEST_TMPDIR/pw" -info -noout
+    "$REAL_OPENSSL" pkcs12 -in "$p12" -passin "file:$BATS_TEST_TMPDIR/pw" -clcerts -nokeys |
+        "$REAL_OPENSSL" x509 -noout -subject | grep -q 'CN *= *erin'
+    "$REAL_OPENSSL" pkcs12 -in "$p12" -passin "file:$BATS_TEST_TMPDIR/pw" -cacerts -nokeys |
+        "$REAL_OPENSSL" x509 -noout -fingerprint -sha256 >"$BATS_TEST_TMPDIR/ca.fp"
+    [ "$(cat "$BATS_TEST_TMPDIR/ca.fp")" = "$("$REAL_OPENSSL" x509 -in "$PKI_CA_CERT" -noout -fingerprint -sha256)" ]
+    [ "$("$REAL_OPENSSL" pkcs12 -in "$p12" -passin "file:$BATS_TEST_TMPDIR/pw" -nocerts -nodes | "$REAL_OPENSSL" pkey -pubout)" = \
+      "$("$REAL_OPENSSL" pkey -in "$PKI_CLIENTS_DIR/erin.key" -pubout)" ]
+    ! "$REAL_OPENSSL" pkcs12 -in "$p12" -passin pass:wrong -info -noout 2>/dev/null || false
+    # The password is on no command line, not on stdout/stderr, not in the logs.
+    grep -q '^openssl pkcs12 -export .*-passout stdin' "$CALLS"
+    ! grep -qF -- "$pw" "$CALLS" || false
+    [[ "$output" != *"$pw"* ]]
+    ! grep -rqF -- "$pw" "$ZTVPN_LOG_DIR" || false
+}
+
+@test "add-user: --cert without a local password (ldap) still gets an onboarding file for the .p12" {
+    with_ca
+    export AUTHELIA_BACKEND=ldap
+    run --separate-stderr "$ADD" lisa lisa@example.com --cert
+    [ "$status" -eq 0 ]
+    onboarding="$(kv onboarding)"
+    [ "$(stat -c %a "$onboarding")" = "600" ]
+    [ -n "$(onboarding_field "$onboarding" 'Bundle password')" ]
+    ! grep -q '^One-time password' "$onboarding" || false
+}
+
+@test "add-user: failure after the .p12 was written removes bundle, cert and onboarding" {
+    with_ca
+    stub qrencode 'exit 1'
+    run "$ADD" erin erin@example.com --cert --qr
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Rolling back"* ]]
+    [ ! -e "$PKI_CLIENTS_DIR/erin.p12" ]
+    [ ! -e "$PKI_CLIENTS_DIR/erin.key" ]
+    [ -z "$(pki_valid_serials erin)" ]
+    [ -z "$(ls -A "$ZTVPN_SECRETS_DIR/onboarding" 2>/dev/null)" ]
+    [ -z "$(find "$PKI_CLIENTS_DIR" -name '.*')" ]
+}
+
+@test "device enroll --cert: .p12 password only in a 0600 onboarding file; remove archives the bundle" {
+    with_ca
+    "$ADD" alice alice@example.com >/dev/null 2>&1
+    record_openssl
+    run "$DEVICE" enroll --user alice --device phone --type phone --cert
+    [ "$status" -eq 0 ]
+    p12="$(sed -n 's/^p12=//p' <<<"$output")"
+    onboarding="$(sed -n 's/^onboarding=//p' <<<"$output")"
+    [ "$p12" = "$PKI_CLIENTS_DIR/alice--phone.p12" ]
+    [ "$(stat -c %a "$p12")" = "600" ]
+    [[ "$onboarding" == "$ZTVPN_SECRETS_DIR/onboarding/alice--phone-"*.txt ]]
+    [ "$(stat -c %a "$onboarding")" = "600" ]
+    pw="$(onboarding_field "$onboarding" 'Bundle password')"
+    [ "${#pw}" -eq 24 ]
+    printf '%s\n' "$pw" >"$BATS_TEST_TMPDIR/pw"
+    "$REAL_OPENSSL" pkcs12 -in "$p12" -passin "file:$BATS_TEST_TMPDIR/pw" -info -noout
+    ! grep -qF -- "$pw" "$CALLS" || false
+    [[ "$output" != *"$pw"* ]]
+
+    run "$DEVICE" remove --user alice --device phone
+    [ "$status" -eq 0 ]
+    [ ! -e "$p12" ]
+    [ -f "$(ls -d "$ZTVPN_BACKUP_DIR"/revoked/alice--phone-*)/certs/alice--phone.p12" ]
+}
+
+@test "device enroll --cert: failure after the .p12 rolls everything back" {
+    with_ca
+    "$ADD" alice alice@example.com >/dev/null 2>&1
+    before="$(ls "$ZTVPN_SECRETS_DIR/onboarding")"
+    stub qrencode 'exit 1'
+    run "$DEVICE" enroll --user alice --device phone --cert --qr
+    [ "$status" -ne 0 ]
+    [ ! -e "$PKI_CLIENTS_DIR/alice--phone.p12" ]
+    [ ! -e "$PKI_CLIENTS_DIR/alice--phone.key" ]
+    [ -z "$(pki_valid_serials alice--phone)" ]
+    [ "$(ls "$ZTVPN_SECRETS_DIR/onboarding")" = "$before" ]
+    ! wg_peer_exists alice--phone
+}
+
 @test "add-user: never sends mail" {
     stub sendmail 'exit 0'
     stub mail 'exit 0'
@@ -294,6 +399,11 @@ setup_bob_family() {
     [ "$(stat -c %a "$archive")" = "700" ]
     [ -f "$archive/wireguard/bob--laptop/public.key" ]
     [ -f "$archive/certs/bob.key" ]
+    # The importable bundles go with the keys; bobby keeps his.
+    [ -f "$archive/certs/bob.p12" ]
+    [ -f "$archive/certs/bob--laptop.p12" ]
+    [ ! -e "$PKI_CLIENTS_DIR/bob.p12" ]
+    [ -f "$PKI_CLIENTS_DIR/bobby.p12" ]
     grep -q 'revoke-user .*user=bob .*result=ok' "$ZTVPN_LOG_DIR/audit.log"
 }
 

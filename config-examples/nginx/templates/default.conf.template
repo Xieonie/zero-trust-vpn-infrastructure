@@ -52,4 +52,7 @@ server {
     listen 443 ssl default_server;
     server_name _;
     ssl_reject_handshake on;
+    # MTLS=yes switches TLS session resumption off here too: nginx looks
+    # resumed sessions up in this server's session cache.
+    include /etc/nginx/snippets/mtls.conf;
 }

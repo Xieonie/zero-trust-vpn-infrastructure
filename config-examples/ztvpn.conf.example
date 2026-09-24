@@ -65,6 +65,22 @@ PKI_CRL_URL=
 PKI_SERVER_SANS=*.example.com
 # Server certs with fewer days left are re-issued by pki-setup/cert-renewal
 PKI_RENEW_DAYS=30
+# cert-renewal.sh renew regenerates the CRL when fewer days than this are
+# left until its nextUpdate (CRLs are valid for 30 days)
+PKI_CRL_RENEW_DAYS=7
+# yes = .p12 bundles use 3DES/SHA1 for clients that cannot import the
+# OpenSSL 3 default (AES-256) bundles, e.g. older macOS/iOS/Android
+PKI_P12_COMPAT=no
+
+# --- Mutual TLS at the reverse proxy ------------------------------------
+# yes = every HTTPS request to nginx (portal and applications) needs a client
+# certificate issued by this CA that is not revoked, on top of the Authelia
+# login. Users must import the .p12 bundle created by add-user.sh --cert or
+# device-enrollment.sh enroll --cert; without it they get a 403 page.
+# Needs a daily "scripts/automation/cert-renewal.sh renew" (cron): nginx
+# rejects every client once the CRL's nextUpdate has passed.
+# After changing it, re-run scripts/setup/initial-setup.sh.
+MTLS=no
 
 # --- Authelia -----------------------------------------------------------
 # file (users_database.yml) or ldap

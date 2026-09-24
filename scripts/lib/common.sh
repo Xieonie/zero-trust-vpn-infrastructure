@@ -152,6 +152,15 @@ PKI_CERT_DAYS="${PKI_CERT_DAYS:-365}"
 # "ec:<curve>" or "rsa:<bits>"
 PKI_CA_KEY_ALG="${PKI_CA_KEY_ALG:-ec:secp384r1}"
 PKI_KEY_ALG="${PKI_KEY_ALG:-ec:prime256v1}"
+# cert-renewal.sh renew regenerates the CRL when fewer days than this are
+# left until its nextUpdate (openssl.cnf default_crl_days is 30).
+PKI_CRL_RENEW_DAYS="${PKI_CRL_RENEW_DAYS:-7}"
+# yes = client .p12 bundles use 3DES/SHA1 instead of AES-256/PBKDF2, for
+# clients that cannot import OpenSSL 3 defaults (older macOS/iOS/Android).
+PKI_P12_COMPAT="${PKI_P12_COMPAT:-no}"
+# Mutual TLS at nginx: yes = every HTTPS request needs a client certificate
+# from this CA that is not revoked (scripts/lib/proxy.sh).
+MTLS="${MTLS:-no}"
 
 # Authelia
 AUTHELIA_DIR="${AUTHELIA_DIR:-$ZTVPN_HOME/authelia}"
@@ -180,6 +189,10 @@ AUTHELIA_SERVICE="${AUTHELIA_SERVICE:-authelia}"
 AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-}"
 AUTHELIA_CONFIG="${AUTHELIA_CONFIG:-$AUTHELIA_DIR/configuration.yml}"
 TLS_PROXY_SERVICE="${TLS_PROXY_SERVICE:-nginx}"
+# Explicit container name of the TLS proxy if it is not run via compose.
+TLS_PROXY_CONTAINER="${TLS_PROXY_CONTAINER:-}"
+# Rendered by initial-setup.sh from MTLS, included by every HTTPS server.
+MTLS_SNIPPET="${MTLS_SNIPPET:-$CONFIG_PATH/nginx/snippets/mtls.conf}"
 
 # Admin addresses that automated blocking must never touch
 ADMIN_ALLOWLIST="${ADMIN_ALLOWLIST:-}"
@@ -397,3 +410,5 @@ source "$ZTVPN_LIB_DIR/authelia.sh"
 source "$ZTVPN_LIB_DIR/pki.sh"
 # shellcheck source=scripts/lib/firewall.sh
 source "$ZTVPN_LIB_DIR/firewall.sh"
+# shellcheck source=scripts/lib/proxy.sh
+source "$ZTVPN_LIB_DIR/proxy.sh"

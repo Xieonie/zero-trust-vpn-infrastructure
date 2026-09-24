@@ -39,8 +39,10 @@ jobs:
         run: |
           for f in $(git ls-files '*.yml' '*.yaml'); do yq '.' "$f" >/dev/null || exit 1; done
 
-      - name: Pull Authelia image for config validation tests
-        run: docker pull authelia/authelia:4.39
+      - name: Pull Authelia and nginx images for config validation and mTLS handshake tests
+        run: |
+          docker pull authelia/authelia:4.39
+          docker pull nginx:1.27-alpine
 
       - name: bats
         run: sudo -E env "PATH=$PATH" bats tests/

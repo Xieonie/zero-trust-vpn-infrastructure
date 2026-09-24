@@ -135,6 +135,11 @@ check_settings() {
         read -r -p "$example is a placeholder. Continue with the example values (test install only)? [y/N] " answer
         [[ "$answer" == [yY] ]] || die "Edit $ZTVPN_CONFIG and run again."
     fi
+    validate_yes_no "$MTLS" || die "MTLS in $ZTVPN_CONFIG must be yes or no, not '$MTLS'"
+    # docker-compose.yml mounts the CA certificate and CRL from these paths.
+    if [[ "$MTLS" == yes && ("$PKI_CA_CERT" != "$CERTS_PATH/ca/ca.crt" || "$PKI_CRL" != "$CERTS_PATH/crl/ca.crl") ]]; then
+        die "MTLS=yes needs PKI_CA_CERT=$CERTS_PATH/ca/ca.crt and PKI_CRL=$CERTS_PATH/crl/ca.crl (the paths docker-compose.yml mounts)"
+    fi
     # nginx is published only on this address (Docker ports bypass nftables).
     PROXY_ADDR="$(proxy_bind_addr)" ||
         die "Give this host an address in SERVICES_SUBNET or set PROXY_BIND_ADDR in $ZTVPN_CONFIG"
@@ -253,16 +258,19 @@ detect_tz() {
 }
 
 # nginx templates/snippets referenced by docker-compose.yml. Files edited
-# locally are kept (with a warning), new ones are added.
+# locally are kept (with a warning), new ones are added. snippets/mtls.conf
+# is generated from MTLS on every run instead (see deploy_mtls_snippet).
 deploy_nginx() {
     local src="$ZTVPN_REPO_ROOT/config-examples/nginx" dest="$CONFIG_PATH/nginx" f rel
     if [[ ! -d "$src" ]]; then
         warn "No config-examples/nginx in this checkout: populate $dest/templates and $dest/snippets before starting nginx"
+        deploy_mtls_snippet
         return 0
     fi
     install -d -m 755 -o root -g root "$dest"
     while IFS= read -r -d '' f; do
         rel="${f#"$src"/}"
+        [[ "$rel" == snippets/mtls.conf ]] && continue
         install -d -m 755 -o root -g root "$(dirname "$dest/$rel")"
         if [[ ! -e "$dest/$rel" ]]; then
             install -m 644 -o root -g root "$f" "$dest/$rel"
@@ -270,6 +278,36 @@ deploy_nginx() {
             warn "$dest/$rel differs from $f; keeping the local version"
         fi
     done < <(find "$src" -type f -print0)
+    deploy_mtls_snippet
+}
+
+# Writes $MTLS_SNIPPET for the current MTLS setting. Sets MTLS_CHANGED=1 if
+# its content changed, so a running nginx can be restarted to apply it.
+MTLS_CHANGED=0
+deploy_mtls_snippet() {
+    if [[ "$MTLS" == yes ]]; then
+        [[ -f "$PKI_CA_CERT" && -f "$PKI_CRL" ]] ||
+            die "MTLS=yes but $PKI_CA_CERT or $PKI_CRL is missing; run pki-setup.sh"
+    fi
+    local content bad
+    content="$(mtls_snippet "$MTLS")" || die "Cannot render $MTLS_SNIPPET"
+    # Locally kept (older or own) templates must include the snippet too,
+    # or their servers would not ask for a client certificate.
+    bad="$(mtls_unprotected_templates "$CONFIG_PATH/nginx/templates")"
+    if [[ -n "$bad" && "$MTLS" == yes ]]; then
+        die "MTLS=yes but these templates have HTTPS servers without 'include /etc/nginx/snippets/mtls.conf;' (see config-examples/nginx/templates): $(tr '\n' ' ' <<<"$bad")"
+    fi
+    install -d -m 755 -o root -g root "$(dirname "$MTLS_SNIPPET")"
+    if [[ ! -f "$MTLS_SNIPPET" ]] || [[ "$(<"$MTLS_SNIPPET")" != "$content" ]]; then
+        printf '%s\n' "$content" | atomic_write "$MTLS_SNIPPET" 644
+        MTLS_CHANGED=1
+    fi
+    if [[ "$MTLS" == yes ]]; then
+        info "MTLS=yes: nginx requires client certificates ($MTLS_SNIPPET). Users need the .p12 from add-user.sh/device-enrollment.sh --cert."
+        info "Schedule '$ZTVPN_REPO_ROOT/scripts/automation/cert-renewal.sh renew' daily so the CRL never expires"
+    else
+        info "MTLS=no: nginx does not check client certificates"
+    fi
 }
 
 deploy_compose() {
@@ -325,6 +363,12 @@ deploy_compose() {
     docker compose --project-directory "$COMPOSE_DIR" -f "$dest" config --quiet ||
         die "docker compose rejected $dest"
     docker compose --project-directory "$COMPOSE_DIR" -f "$dest" up -d --remove-orphans
+    # Changed snippets are not a compose change; restart nginx so it
+    # applies the new MTLS setting.
+    if ((MTLS_CHANGED)); then
+        docker compose --project-directory "$COMPOSE_DIR" -f "$dest" restart "$TLS_PROXY_SERVICE" ||
+            warn "Could not restart $TLS_PROXY_SERVICE; restart it to apply MTLS=$MTLS"
+    fi
     success "Container stack started"
 }
 

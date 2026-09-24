@@ -15,11 +15,14 @@ Commands:
          Create WireGuard peer "U--D" for an existing Authelia user.
          --type   laptop | desktop | phone | tablet (default: laptop)
          --ip     fixed tunnel address inside $VPN_SUBNET (default: next free)
-         --cert   also issue a client certificate (CN = U--D)
+         --cert   also issue a client certificate (CN = U--D) and a PKCS#12 bundle
+                  U--D.p12 whose password is written to a 0600 onboarding file under
+                  $ZTVPN_SECRETS_DIR/onboarding/ (required for HTTPS when MTLS=yes)
          --qr     write a QR code PNG of the client config (needs qrencode)
          --dry-run  validate and show what would happen, change nothing
   remove --user U --device D [--reason R]
-         Remove the peer, revoke its certificate, mark it revoked in the inventory.
+         Remove the peer, revoke its certificate (key, certificate and .p12 are
+         archived), mark it revoked in the inventory.
   list   [--user U] [--json]
          List inventory entries.
   show   --user U --device D
@@ -85,7 +88,7 @@ inventory_read() {
 # enroll
 # --------------------------------------------------------------------------
 
-COMMITTED=0 PEER_ATTEMPTED=0 CERT_ATTEMPTED=0 QR_FILE=""
+COMMITTED=0 PEER_ATTEMPTED=0 CERT_ATTEMPTED=0 QR_FILE="" ONBOARDING_FILE=""
 
 enroll_rollback() {
     local rc=$?
@@ -94,7 +97,9 @@ enroll_rollback() {
     ((rc == 0)) && rc=1
     ((PEER_ATTEMPTED || CERT_ATTEMPTED)) && warn "Rolling back enrolment of $PEER"
     [[ -n "$QR_FILE" ]] && rm -f "$QR_FILE"
+    [[ -n "$ONBOARDING_FILE" ]] && rm -f "$ONBOARDING_FILE"
     if ((CERT_ATTEMPTED)); then
+        rm -f "$PKI_CLIENTS_DIR/$PEER.p12"
         pki_revoke "$PEER" cessationOfOperation
         case $? in
             0|2) rm -f "$PKI_CLIENTS_DIR/$PEER.key" "$PKI_CLIENTS_DIR/$PEER.crt" ;;
@@ -178,7 +183,7 @@ cmd_enroll() {
 
     if ((DRY_RUN)); then
         info "DRY RUN: would create peer $PEER ($DEVICE_TYPE) with $ip in $WG_CONF"
-        ((WANT_CERT)) && info "DRY RUN: would issue client certificate CN=$PEER"
+        ((WANT_CERT)) && info "DRY RUN: would issue client certificate CN=$PEER and $PKI_CLIENTS_DIR/$PEER.p12"
         ((WANT_QR)) && info "DRY RUN: would write QR code $WG_CLIENTS_DIR/$PEER/$PEER.png"
         info "DRY RUN: would add $PEER to $DEVICE_INVENTORY"
         printf 'peer=%s\nip=%s\ndry_run=1\n' "$PEER" "$ip"
@@ -192,11 +197,31 @@ cmd_enroll() {
     wg_apply
     success "WireGuard peer $PEER added with $ip"
 
-    local cert=""
+    local cert="" p12=""
     if ((WANT_CERT)); then
         CERT_ATTEMPTED=1
         cert="$(pki_issue client "$PEER")"
         success "Client certificate issued: $cert"
+        # The bundle password goes to openssl on stdin and into the 0600
+        # onboarding file only, never onto a command line or stdout.
+        local p12_pass
+        p12_pass="$(gen_password 24)"
+        p12="$(printf '%s\n' "$p12_pass" | pki_export_p12 "$PEER")"
+        (umask 077; mkdir -p "$ZTVPN_SECRETS_DIR/onboarding")
+        chmod 700 "$ZTVPN_SECRETS_DIR/onboarding"
+        ONBOARDING_FILE="$ZTVPN_SECRETS_DIR/onboarding/$PEER-$(date +%Y%m%dT%H%M%S).txt"
+        {
+            printf 'Zero Trust VPN device certificate for %s (device %s)\n\n' "$USERNAME" "$DEVICE"
+            printf 'Client certificate: %s\n' "$cert"
+            printf 'Certificate bundle: %s\n' "$p12"
+            printf 'Bundle password:    %s\n' "$p12_pass"
+            if [[ "$MTLS" == yes ]]; then
+                printf '\nImport the bundle on the device: https://%s requires it (MTLS=yes).\n' "$AUTH_DOMAIN"
+            fi
+            printf '\nDeliver over a secure channel and delete this file afterwards.\n'
+        } | atomic_write "$ONBOARDING_FILE" 600
+        unset p12_pass
+        success "PKCS#12 bundle written: $p12 (password in $ONBOARDING_FILE)"
     fi
 
     local conf="$WG_CLIENTS_DIR/$PEER/$PEER.conf"
@@ -226,8 +251,9 @@ cmd_enroll() {
     trap - EXIT
     success "Device $PEER enrolled"
     printf 'peer=%s\nip=%s\nclient_config=%s\n' "$PEER" "$ip" "$conf"
-    [[ -n "$cert" ]] && printf 'cert=%s\n' "$cert"
+    [[ -n "$cert" ]] && printf 'cert=%s\np12=%s\n' "$cert" "$p12"
     [[ -n "$QR_FILE" ]] && printf 'qr=%s\n' "$QR_FILE"
+    [[ -n "$ONBOARDING_FILE" ]] && printf 'onboarding=%s\n' "$ONBOARDING_FILE"
     return 0
 }
 
@@ -272,7 +298,7 @@ cmd_remove() {
             2) ;;
             *) failures+=("revoke certificate $PEER") ;;
         esac
-        for f in "$PKI_CLIENTS_DIR/$PEER.key" "$PKI_CLIENTS_DIR/$PEER.crt"; do
+        for f in "$PKI_CLIENTS_DIR/$PEER.key" "$PKI_CLIENTS_DIR/$PEER.crt" "$PKI_CLIENTS_DIR/$PEER.p12"; do
             [[ -f "$f" ]] || continue
             found=1
             (umask 077; mkdir -p "$archive/certs" && mv -f "$f" "$archive/certs/") ||

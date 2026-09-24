@@ -79,3 +79,21 @@ setup() {
     d="$(pki_days_left "$crt")"
     [ "$d" -ge 9 ] && [ "$d" -le 10 ]
 }
+
+@test "CRL regeneration always produces a new inode (nginx caches by inode+mtime)" {
+    pki_init_ca
+    a="$(stat -c %i "$PKI_CRL")"
+    pki_gen_crl
+    b="$(stat -c %i "$PKI_CRL")"
+    [ "$a" != "$b" ]
+    [ "$(stat -c %a "$PKI_CRL")" = "644" ]
+}
+
+@test "days left rounds down for expired certificates" {
+    pki_init_ca
+    crt="$(pki_issue client erin 1)"
+    pki_seconds_left() { echo -3600; }
+    [ "$(pki_days_left "$crt")" = "-1" ]
+    pki_seconds_left() { echo 3600; }
+    [ "$(pki_days_left "$crt")" = "0" ]
+}

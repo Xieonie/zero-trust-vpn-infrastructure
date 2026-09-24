@@ -9,38 +9,52 @@
 #          Exit 0 = all fine, 1 = something within --days, 2 = something
 #          within --critical days or expired.
 #   renew  reissues server certificates within --days (same CN and SANs,
-#          new key), revokes the superseded serial and reloads the TLS
-#          terminator. Client certificates are only reported unless
-#          --reissue-clients is given. The CA is never regenerated.
+#          new key), revokes the superseded serial, regenerates the CRL
+#          when its nextUpdate is near and reloads the TLS terminator.
+#          Client certificates are only reported unless --reissue-clients
+#          is given. The CA is never regenerated.
+#   crl    regenerates the CRL unconditionally (and reloads with MTLS=yes).
 
 set -Eeuo pipefail
 # shellcheck source=scripts/lib/common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/cert-renewal.log}"
-# TLS terminator that serves the server certificates: the compose service
-# in $COMPOSE_DIR, or an explicit container name if not run via compose.
-TLS_PROXY_CONTAINER="${TLS_PROXY_CONTAINER:-}"
+# The TLS terminator is the compose service $TLS_PROXY_SERVICE, or
+# TLS_PROXY_CONTAINER if set (scripts/lib/proxy.sh, tls_proxy_reload).
 CERT_WARN_DAYS="${CERT_WARN_DAYS:-30}"
 CERT_CRITICAL_DAYS="${CERT_CRITICAL_DAYS:-7}"
 CERT_CA_WARN_DAYS="${CERT_CA_WARN_DAYS:-180}"
+# CRL: warning below PKI_CRL_RENEW_DAYS (renew regenerates it then),
+# critical below CRL_CRITICAL_DAYS days until nextUpdate.
+CRL_CRITICAL_DAYS="${CRL_CRITICAL_DAYS:-2}"
+# This script reloads the proxy itself, once, after all CRL changes.
+PKI_CRL_RELOAD=no
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") check [--days N] [--critical N]
-       $(basename "$0") renew [--days N] [--dry-run] [--reissue-clients] [--no-reload]
+Usage: $(basename "$0") check [--days N] [--critical N] [--crl-days N]
+       $(basename "$0") renew [--days N] [--crl-days N] [--dry-run] [--reissue-clients] [--no-reload]
+       $(basename "$0") crl [--no-reload]
 
-check               List certificates and days left.
-                    Exit 0 ok, 1 warning (<= --days), 2 critical (<= --critical or expired).
+check               List certificates and days left, and the CRL with days until its
+                    nextUpdate. Exit 0 ok, 1 warning (certs <= --days, CRL < --crl-days),
+                    2 critical (certs <= --critical, CRL < $CRL_CRITICAL_DAYS days, or expired).
 renew               Reissue server certificates expiring within --days with the same
                     CN/SANs and a new key; the old key and certificate are backed up
                     first and restored if issuing fails; the old serial is revoked
-                    (superseded) and the TLS terminator (compose service $TLS_PROXY_SERVICE,
-                    or TLS_PROXY_CONTAINER) is reloaded with SIGHUP.
+                    (superseded). Regenerate the CRL if fewer than --crl-days days are
+                    left until its nextUpdate. The TLS terminator (compose service
+                    $TLS_PROXY_SERVICE, or TLS_PROXY_CONTAINER) is reloaded with SIGHUP
+                    after renewed server certificates, and after a new CRL if MTLS=yes.
+crl                 Regenerate the CRL now (e.g. after a manual revocation); reload the
+                    TLS terminator if MTLS=yes.
 
 Options:
   --days N            Renewal/warning threshold in days (default $CERT_WARN_DAYS)
   --critical N        Critical threshold in days (default $CERT_CRITICAL_DAYS)
+  --crl-days N        Regenerate/warn when the CRL has fewer days left (default
+                      PKI_CRL_RENEW_DAYS=$PKI_CRL_RENEW_DAYS)
   --dry-run           Show what renew would do, change nothing
   --reissue-clients   Also reissue expiring client certificates. The new private key is
                       generated here and stays in $PKI_CLIENTS_DIR until you hand it to
@@ -50,6 +64,10 @@ Options:
 
 The CA certificate is only reported (warning within $CERT_CA_WARN_DAYS days); a CA rollover
 is a manual, planned operation and is never automated.
+
+The CRL is valid for 30 days. With MTLS=yes nginx rejects every client once it has
+expired, so run renew daily, e.g. in /etc/cron.d/ztvpn-cert-renewal:
+  17 3 * * * root $ZTVPN_REPO_ROOT/scripts/automation/cert-renewal.sh renew
 EOF
 }
 
@@ -85,7 +103,8 @@ revoke_serial() {
     mapfile -t passin < <(_pki_passin)
     openssl ca -config "$PKI_CA_CNF" "${passin[@]}" \
         -revoke "$PKI_CA_DIR/newcerts/$dbs.pem" -crl_reason "$reason" || return 1
-    pki_gen_crl
+    pki_gen_crl || return 1
+    CRL_CHANGED=1
 }
 
 # SANs of an existing server cert in pki_issue argument form, minus the CN
@@ -166,12 +185,52 @@ cmd_check() {
             warning) ((worst < 1)) && worst=1 ;;
         esac
     done < <(list_certs)
+
+    local crl_rc=0
+    check_crl || crl_rc=$?
+    ((crl_rc > worst)) && worst="$crl_rc"
     case "$worst" in
-        0) info "All certificates are outside the $CERT_WARN_DAYS day window" ;;
-        1) warn "Some certificates expire within $CERT_WARN_DAYS days" ;;
-        2) error "Some certificates are expired or expire within $CERT_CRITICAL_DAYS days" ;;
+        0) info "All certificates are outside the $CERT_WARN_DAYS day window, the CRL is current" ;;
+        1) warn "Some certificates expire within $CERT_WARN_DAYS days, or the CRL is due for regeneration" ;;
+        2) error "Some certificates or the CRL are expired or about to expire" ;;
     esac
     return "$worst"
+}
+
+# Status of the CRL: ok, warning, critical, expired, missing or unreadable.
+crl_status() {
+    local days
+    [[ -f "$PKI_CRL" ]] || { echo missing; return 0; }
+    days="$(pki_crl_days_left)" || { echo unreadable; return 0; }
+    if ((days < 0)); then
+        echo expired
+    elif ((days < CRL_CRITICAL_DAYS)); then
+        echo critical
+    elif ((days < PKI_CRL_RENEW_DAYS)); then
+        echo warning
+    else
+        echo ok
+    fi
+}
+
+# Prints the CRL row of "check"; returns 0 ok, 1 warning, 2 critical.
+check_crl() {
+    local status days="-" next="-"
+    status="$(crl_status)"
+    if [[ "$status" != missing && "$status" != unreadable ]]; then
+        days="$(pki_crl_days_left)"
+        next="$(openssl crl -in "$PKI_CRL" -noout -nextupdate)"
+        next="${next#nextUpdate=}"
+    fi
+    printf '%-7s %-32s %6s  %-9s %s\n' crl "$(basename "$PKI_CRL")" "$days" "$status" "$next"
+    case "$status" in
+        ok) return 0 ;;
+        warning) return 1 ;;
+        *)
+            [[ "$MTLS" == yes ]] && error "MTLS=yes: nginx rejects every client certificate once the CRL has expired"
+            return 2
+            ;;
+    esac
 }
 
 # --------------------------------------------------------------------------
@@ -235,39 +294,6 @@ renew_one() {
     return 0
 }
 
-reload_tls_terminator() {
-    if ! command -v docker >/dev/null 2>&1; then
-        warn "docker not found; reload the TLS terminator manually to pick up the new certificates"
-        return 1
-    fi
-    local running target
-    local -a kill_cmd
-    if [[ -n "$TLS_PROXY_CONTAINER" ]]; then
-        target="container $TLS_PROXY_CONTAINER"
-        running="$(docker inspect -f '{{.State.Running}}' "$TLS_PROXY_CONTAINER" 2>/dev/null || true)"
-        [[ "$running" == true ]] || running=""
-        kill_cmd=(docker kill -s SIGHUP "$TLS_PROXY_CONTAINER")
-    elif [[ -f "$COMPOSE_FILE_PATH" ]]; then
-        target="compose service $TLS_PROXY_SERVICE"
-        local -a compose=(docker compose -f "$COMPOSE_FILE_PATH" --project-directory "$(dirname "$COMPOSE_FILE_PATH")")
-        running="$("${compose[@]}" ps -q --status running "$TLS_PROXY_SERVICE" 2>/dev/null || true)"
-        kill_cmd=("${compose[@]}" kill -s SIGHUP "$TLS_PROXY_SERVICE")
-    else
-        warn "No $COMPOSE_FILE_PATH and no TLS_PROXY_CONTAINER set; reload the TLS terminator manually"
-        return 1
-    fi
-    if [[ -z "$running" ]]; then
-        info "The $target is not running; it will load the new certificates on start"
-        return 0
-    fi
-    if "${kill_cmd[@]}" >/dev/null; then
-        success "Sent SIGHUP (reload) to the $target"
-    else
-        error "Could not reload the $target; reload it manually"
-        return 1
-    fi
-}
-
 cmd_renew() {
     pki_ca_exists || die "No CA at $PKI_CA_DIR"
     if ((!DRY_RUN)); then
@@ -313,11 +339,28 @@ cmd_renew() {
         warn "Have the users submit a new CSR, or rerun with --reissue-clients"
     fi
 
-    if ((renewed_server)); then
-        if ((NO_RELOAD)); then
-            warn "--no-reload given; reload the TLS terminator yourself"
+    local crl
+    crl="$(crl_status)"
+    if [[ "$crl" != ok ]]; then
+        if ((DRY_RUN)); then
+            info "[dry-run] would regenerate the CRL (status: $crl)"
+        elif pki_gen_crl; then
+            CRL_CHANGED=1
+            success "CRL regenerated (was: $crl), next update $(openssl crl -in "$PKI_CRL" -noout -nextupdate | cut -d= -f2)"
         else
-            reload_tls_terminator || failed=1
+            error "Could not regenerate the CRL $PKI_CRL"
+            failed=1
+        fi
+    fi
+
+    local why=""
+    ((renewed_server)) && why="new server certificates"
+    ((CRL_CHANGED)) && [[ "$MTLS" == yes ]] && why="${why:+$why and }a new CRL"
+    if [[ -n "$why" ]]; then
+        if ((NO_RELOAD)); then
+            warn "--no-reload given; reload the TLS terminator yourself to apply $why"
+        else
+            tls_proxy_reload || failed=1
         fi
     fi
     [[ -n "$BACKUP_ROOT" && -d "$BACKUP_ROOT" ]] && info "Previous keys and certificates backed up in $BACKUP_ROOT"
@@ -325,16 +368,37 @@ cmd_renew() {
 }
 
 # --------------------------------------------------------------------------
+# crl
+# --------------------------------------------------------------------------
+
+cmd_crl() {
+    pki_ca_exists || die "No CA at $PKI_CA_DIR"
+    require_root
+    ztvpn_lock pki
+    pki_gen_crl || die "Could not regenerate the CRL $PKI_CRL"
+    success "CRL $PKI_CRL regenerated, next update $(openssl crl -in "$PKI_CRL" -noout -nextupdate | cut -d= -f2)"
+    if [[ "$MTLS" != yes ]]; then
+        info "MTLS=$MTLS: nginx does not check client certificates, no reload needed"
+    elif ((NO_RELOAD)); then
+        warn "--no-reload given; reload the TLS terminator yourself, nginx still uses the previous CRL"
+    else
+        tls_proxy_reload || return 1
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
 
 DRY_RUN=0
 REISSUE_CLIENTS=0
 NO_RELOAD=0
+CRL_CHANGED=0
 
 main() {
     local cmd="${1:-}"
     case "$cmd" in
         -h | --help) usage; exit 0 ;;
-        check | renew) shift ;;
+        check | renew | crl) shift ;;
         "") usage >&2; exit 1 ;;
         *) usage >&2; die "Unknown command: $cmd" ;;
     esac
@@ -342,6 +406,7 @@ main() {
         case "$1" in
             --days) CERT_WARN_DAYS="${2:-}"; shift 2 || die "--days needs a value" ;;
             --critical) CERT_CRITICAL_DAYS="${2:-}"; shift 2 || die "--critical needs a value" ;;
+            --crl-days) PKI_CRL_RENEW_DAYS="${2:-}"; shift 2 || die "--crl-days needs a value" ;;
             --dry-run) DRY_RUN=1; shift ;;
             --reissue-clients) REISSUE_CLIENTS=1; shift ;;
             --no-reload) NO_RELOAD=1; shift ;;
@@ -352,17 +417,20 @@ main() {
     [[ "$CERT_WARN_DAYS" =~ ^[0-9]{1,4}$ ]] || die "Invalid --days: $CERT_WARN_DAYS"
     [[ "$CERT_CRITICAL_DAYS" =~ ^[0-9]{1,4}$ ]] || die "Invalid --critical: $CERT_CRITICAL_DAYS"
     [[ "$CERT_CA_WARN_DAYS" =~ ^[0-9]{1,5}$ ]] || die "Invalid CERT_CA_WARN_DAYS: $CERT_CA_WARN_DAYS"
+    [[ "$PKI_CRL_RENEW_DAYS" =~ ^[0-9]{1,3}$ ]] || die "Invalid --crl-days / PKI_CRL_RENEW_DAYS: $PKI_CRL_RENEW_DAYS"
+    [[ "$CRL_CRITICAL_DAYS" =~ ^[0-9]{1,3}$ ]] || die "Invalid CRL_CRITICAL_DAYS: $CRL_CRITICAL_DAYS"
+    validate_yes_no "$MTLS" || die "Invalid MTLS: $MTLS (yes or no)"
     [[ -z "$TLS_PROXY_CONTAINER" || "$TLS_PROXY_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Invalid TLS_PROXY_CONTAINER"
     [[ "$TLS_PROXY_SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Invalid TLS_PROXY_SERVICE"
     ((CERT_CRITICAL_DAYS <= CERT_WARN_DAYS)) || die "--critical must not exceed --days"
     require_cmd openssl
 
     local rc=0
-    if [[ "$cmd" == check ]]; then
-        cmd_check || rc=$?
-    else
-        cmd_renew || rc=$?
-    fi
+    case "$cmd" in
+        check) cmd_check || rc=$? ;;
+        renew) cmd_renew || rc=$? ;;
+        crl) cmd_crl || rc=$? ;;
+    esac
     exit "$rc"
 }
 

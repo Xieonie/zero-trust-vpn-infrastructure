@@ -241,16 +241,24 @@ remove_peer() {
     echo "removed from $WG_CONF (and from $WG_INTERFACE if it is up); archived in $qdir"
 }
 
-revoke_cert_plan() { echo "revoke client certificates with CN=$1 (keyCompromise)"; }
+revoke_cert_plan() { echo "revoke client certificates with CN=$1 (keyCompromise), archive its key/cert/.p12"; }
 revoke_cert() {
-    local rc=0
+    local rc=0 msg f archive=""
     pki_ca_exists || { echo "no CA configured, nothing to revoke"; return 0; }
     pki_revoke "$1" keyCompromise >/dev/null || rc=$?
     case "$rc" in
-        0) echo "revoked, CRL regenerated" ;;
-        2) echo "no valid certificate with CN=$1" ;;
+        0) msg="revoked, CRL regenerated" ;;
+        2) msg="no valid certificate with CN=$1" ;;
         *) return 1 ;;
     esac
+    # Take the key material (and the importable .p12 bundle) out of the
+    # live directory, as revoke-user.sh does.
+    for f in "$PKI_CLIENTS_DIR/$1.key" "$PKI_CLIENTS_DIR/$1.crt" "$PKI_CLIENTS_DIR/$1.p12"; do
+        [[ -f "$f" ]] || continue
+        [[ -n "$archive" ]] || archive="$ZTVPN_BACKUP_DIR/revoked/$1-$INCIDENT_ID/certs"
+        (umask 077; mkdir -p "$archive" && mv -f "$f" "$archive/") || { echo "$msg; could not archive $f"; return 1; }
+    done
+    echo "$msg${archive:+; key material archived in $archive}"
 }
 
 disable_user_plan() { echo "set disabled=true for $1 in $AUTHELIA_USERS_DB"; }

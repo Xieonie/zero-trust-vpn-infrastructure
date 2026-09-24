@@ -187,7 +187,7 @@ revoke_certs() {
             *) fail "Could not revoke certificates for $cn" ;;
         esac
         # Take the key material out of the live directory.
-        for f in "$PKI_CLIENTS_DIR/$cn.key" "$PKI_CLIENTS_DIR/$cn.crt"; do
+        for f in "$PKI_CLIENTS_DIR/$cn.key" "$PKI_CLIENTS_DIR/$cn.crt" "$PKI_CLIENTS_DIR/$cn.p12"; do
             [[ -f "$f" ]] || continue
             FOUND=1
             if ! (umask 077; mkdir -p "$ARCHIVE/certs" && mv -f "$f" "$ARCHIVE/certs/"); then

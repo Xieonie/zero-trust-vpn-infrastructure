@@ -22,16 +22,19 @@ Options:
                          Allowed: $KNOWN_GROUPS
   --admin                Also add the user to "admins"
   --device <name>        Name the first device; peer becomes "<user>--<name>"
-  --cert                 Issue a client certificate (CN = peer name)
+  --cert                 Issue a client certificate (CN = peer name) and a PKCS#12
+                         bundle (<name>.p12, with the CA certificate) to import on
+                         the device; required for HTTPS access when MTLS=yes
   --qr                   Write a QR code PNG of the client config (needs qrencode)
   --no-vpn               Only create the account, no WireGuard peer
   -h, --help             Show this help
 
-The one-time password is written to a 0600 file under
-$ZTVPN_SECRETS_DIR/onboarding/ and only its path is printed. Nothing is
-emailed; hand the file and the client config to the user over a secure channel.
+The one-time password (and the .p12 password with --cert) is written to a
+0600 file under $ZTVPN_SECRETS_DIR/onboarding/ and only its path is printed.
+Nothing is emailed; hand the file, the client config and the .p12 to the
+user over a secure channel.
 
-Output (stdout) is key=value lines: user, peer, ip, client_config, cert, qr, onboarding.
+Output (stdout) is key=value lines: user, peer, ip, client_config, cert, p12, qr, onboarding.
 EOF
 }
 
@@ -116,7 +119,7 @@ fi
 # --------------------------------------------------------------------------
 
 COMMITTED=0 USER_CREATED=0 PEER_ATTEMPTED=0 CERT_ATTEMPTED=0 INVENTORY_ADDED=0
-QR_FILE="" ONBOARDING_FILE=""
+QR_FILE="" ONBOARDING_FILE="" P12="" P12_PASS=""
 
 rollback() {
     local rc=$?
@@ -133,6 +136,8 @@ rollback() {
             error "Rollback: could not remove $PEER from $DEVICE_INVENTORY"
     fi
     if ((CERT_ATTEMPTED)); then
+        # Its password went away with the onboarding file.
+        rm -f "$PKI_CLIENTS_DIR/$CERT_CN.p12"
         pki_revoke "$CERT_CN" cessationOfOperation
         case $? in
             0|2) rm -f "$PKI_CLIENTS_DIR/$CERT_CN.key" "$PKI_CLIENTS_DIR/$CERT_CN.crt" ;;
@@ -204,6 +209,11 @@ if ((WANT_CERT)); then
     CERT_ATTEMPTED=1
     CERT="$(pki_issue client "$CERT_CN")"
     success "Client certificate issued: $CERT"
+    # Bundle for import on the device. Its password goes to openssl on stdin
+    # and into the onboarding file only, never onto a command line.
+    P12_PASS="$(gen_password 24)"
+    P12="$(printf '%s\n' "$P12_PASS" | pki_export_p12 "$CERT_CN")"
+    success "PKCS#12 bundle written: $P12"
 fi
 
 # 4. QR code (file read by qrencode itself, the key never hits argv)
@@ -227,7 +237,7 @@ if ((WANT_VPN)); then
 fi
 
 # 6. Onboarding file with the one-time credentials
-if [[ -n "$PASSWORD" ]]; then
+if [[ -n "$PASSWORD" || -n "$P12_PASS" ]]; then
     (umask 077; mkdir -p "$ZTVPN_SECRETS_DIR/onboarding")
     chmod 700 "$ZTVPN_SECRETS_DIR/onboarding"
     ONBOARDING_FILE="$ZTVPN_SECRETS_DIR/onboarding/$USERNAME-$(date +%Y%m%dT%H%M%S).txt"
@@ -235,15 +245,26 @@ if [[ -n "$PASSWORD" ]]; then
         printf 'Zero Trust VPN onboarding for %s\n\n' "$USERNAME"
         printf 'Login:              https://%s\n' "$AUTH_DOMAIN"
         printf 'Username:           %s\n' "$USERNAME"
-        printf 'One-time password:  %s\n' "$PASSWORD"
-        printf '\nEnrol a second factor (TOTP or WebAuthn) at first login. Password resets:\nscripts/management/user-account.sh reset-password %s\n' "$USERNAME"
+        if [[ -n "$PASSWORD" ]]; then
+            printf 'One-time password:  %s\n' "$PASSWORD"
+            printf '\nEnrol a second factor (TOTP or WebAuthn) at first login. Password resets:\nscripts/management/user-account.sh reset-password %s\n' "$USERNAME"
+        else
+            printf 'Password:           the directory (LDAP) password\n'
+        fi
         [[ -n "$CLIENT_CONF" ]] && printf 'WireGuard config:   %s\n' "$CLIENT_CONF"
         [[ -n "$QR_FILE" ]] && printf 'WireGuard QR code:  %s\n' "$QR_FILE"
-        [[ -n "$CERT" ]] && printf 'Client certificate: %s (key: %s)\n' "$CERT" "$PKI_CLIENTS_DIR/$CERT_CN.key"
+        if [[ -n "$P12" ]]; then
+            printf 'Client certificate: %s (key: %s)\n' "$CERT" "$PKI_CLIENTS_DIR/$CERT_CN.key"
+            printf 'Certificate bundle: %s\n' "$P12"
+            printf 'Bundle password:    %s\n' "$P12_PASS"
+            if [[ "$MTLS" == yes ]]; then
+                printf '\nImport the bundle into the browser/device: https://%s requires it (MTLS=yes).\n' "$AUTH_DOMAIN"
+            fi
+        fi
         printf '\nDeliver over a secure channel and delete this file afterwards.\n'
     } | atomic_write "$ONBOARDING_FILE" 600
 fi
-unset PASSWORD
+unset PASSWORD P12_PASS
 
 audit add-user "user=$USERNAME peer=${IP:+$PEER} ip=$IP groups=$GROUPS_CSV cert=$WANT_CERT backend=$AUTHELIA_BACKEND"
 COMMITTED=1
@@ -255,6 +276,7 @@ if ((WANT_VPN)); then
     printf 'peer=%s\nip=%s\nclient_config=%s\n' "$PEER" "$IP" "$CLIENT_CONF"
 fi
 [[ -n "$CERT" ]] && printf 'cert=%s\n' "$CERT"
+[[ -n "$P12" ]] && printf 'p12=%s\n' "$P12"
 [[ -n "$QR_FILE" ]] && printf 'qr=%s\n' "$QR_FILE"
 [[ -n "$ONBOARDING_FILE" ]] && printf 'onboarding=%s\n' "$ONBOARDING_FILE"
 exit 0

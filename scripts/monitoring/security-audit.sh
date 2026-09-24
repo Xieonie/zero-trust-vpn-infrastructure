@@ -130,11 +130,11 @@ audit_files() {
     fi
 
     bad=()
-    for f in "$PKI_SERVER_DIR"/*.key "$PKI_CLIENTS_DIR"/*.key; do
+    for f in "$PKI_SERVER_DIR"/*.key "$PKI_CLIENTS_DIR"/*.key "$PKI_CLIENTS_DIR"/*.p12; do
         [[ -f "$f" ]] || continue
         perm_exceeds "$f" 600 && bad+=("$f mode $(perm_of "$f")")
     done
-    result FILE-PKI-KEYS high "Certificate private keys are 0600" "${bad[@]}"
+    result FILE-PKI-KEYS high "Certificate private keys and .p12 bundles are 0600" "${bad[@]}"
 
     if [[ -d "$AUTHELIA_SECRETS_DIR" ]]; then
         bad=()
@@ -226,7 +226,8 @@ audit_pki() {
         record PKI-CRL fail high "CRL exists, is signed by the CA and is current" "$PKI_CRL not found"
         return 0
     fi
-    local next next_epoch now
+    local next next_epoch now renew_days="$PKI_CRL_RENEW_DAYS"
+    [[ "$renew_days" =~ ^[0-9]{1,3}$ ]] || renew_days=7
     sev=medium
     local -a crl_items=()
     if ! openssl crl -in "$PKI_CRL" -CAfile "$PKI_CA_CERT" -noout >/dev/null 2>&1; then
@@ -235,16 +236,64 @@ audit_pki() {
     next="$(openssl crl -in "$PKI_CRL" -noout -nextupdate 2>/dev/null)" || next=""
     next="${next#nextUpdate=}"
     now="$(date +%s)"
+    # With MTLS=yes nginx enforces this CRL: once it has expired, nobody
+    # gets in, so staleness is worse than for an informational CRL.
     if next_epoch="$(date -d "$next" +%s 2>/dev/null)" && [[ -n "$next" ]]; then
         if ((next_epoch < now)); then
-            crl_items+=("CRL expired at $next; clients checking it will fail"); sev=high
-        elif ((next_epoch - now < 7 * 86400)); then
-            crl_items+=("CRL nextUpdate $next is less than 7 days away; run pki_gen_crl")
+            if [[ "$MTLS" == yes ]]; then
+                crl_items+=("CRL expired at $next; with MTLS=yes nginx rejects every client"); sev=critical
+            else
+                crl_items+=("CRL expired at $next; clients checking it will fail"); sev=high
+            fi
+        elif ((next_epoch - now < renew_days * 86400)); then
+            crl_items+=("CRL nextUpdate $next is less than $renew_days days away; run cert-renewal.sh renew (daily)")
+            [[ "$MTLS" == yes ]] && sev=high
         fi
     else
         crl_items+=("CRL has no readable nextUpdate"); sev=high
     fi
     result PKI-CRL "$sev" "CRL exists, is signed by the CA and is current" "${crl_items[@]}"
+}
+
+# --------------------------------------------------------------------------
+# Reverse proxy: client certificates (MTLS)
+# --------------------------------------------------------------------------
+
+audit_proxy() {
+    local title="Reverse proxy client-certificate enforcement matches MTLS"
+    case "$MTLS" in
+        no)
+            # Nothing to enforce, but say so instead of implying device checks.
+            record PROXY-MTLS pass info "$title" \
+                "MTLS=no: nginx does not request or check client certificates; HTTPS access needs only the Authelia login"
+            return 0
+            ;;
+        yes) ;;
+        *)
+            record PROXY-MTLS fail high "$title" "MTLS=$MTLS is neither yes nor no"
+            return 0
+            ;;
+    esac
+    if [[ ! -r "$MTLS_SNIPPET" ]]; then
+        record PROXY-MTLS fail high "$title" "MTLS=yes but $MTLS_SNIPPET does not exist; run initial-setup.sh"
+        return 0
+    fi
+    local -a items=()
+    # Active directives only, comments stripped.
+    local active
+    active="$(sed -e 's/#.*//' "$MTLS_SNIPPET")"
+    grep -Eq '^[[:space:]]*ssl_verify_client[[:space:]]+on;' <<<"$active" ||
+        items+=("$MTLS_SNIPPET has no 'ssl_verify_client on;': client certificates are not enforced")
+    grep -Eq '^[[:space:]]*ssl_crl[[:space:]]+[^;]+;' <<<"$active" ||
+        items+=("$MTLS_SNIPPET has no ssl_crl: revoked certificates would be accepted")
+    grep -Eq '^[[:space:]]*ssl_session_cache[[:space:]]+off;' <<<"$active" ||
+        items+=("$MTLS_SNIPPET does not turn off session resumption: revoked certificates keep working in resumed sessions")
+    ((${#items[@]})) && items+=("re-run initial-setup.sh to regenerate it")
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && items+=("$f has an HTTPS server without include /etc/nginx/snippets/mtls.conf (no client certificate required there)")
+    done < <(mtls_unprotected_templates "$(dirname "$(dirname "$MTLS_SNIPPET")")/templates")
+    result PROXY-MTLS high "$title" "${items[@]}"
 }
 
 # --------------------------------------------------------------------------
@@ -529,6 +578,7 @@ main() {
 
     audit_files
     audit_pki
+    audit_proxy
     audit_wireguard
     audit_firewall
     audit_docker

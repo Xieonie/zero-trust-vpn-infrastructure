@@ -37,7 +37,7 @@ iso27001	A.5.15	Access control	AUTH-DEFAULT-DENY,AUTH-BYPASS,FW-POLICY,WG-ALLOWE
 iso27001	A.5.17	Authentication information	FILE-AUTHELIA-USERS,FILE-AUTHELIA-SECRETS,AUTH-INLINE-SECRETS,FILE-WG-KEY,FILE-WG-CONF,FILE-WG-CLIENTS,FILE-WG-CLIENT-KEYS-ON-SERVER,FILE-CA-PASS	Process for allocating and handing over credentials; user guidance
 iso27001	A.5.18	Access rights	ID-ORPHAN-PEERS,ID-IDLE-ACCOUNTS,ID-UNKNOWN-GROUPS	Documented provisioning/approval and periodic access reviews
 iso27001	A.8.2	Privileged access rights	-	Review membership of the admins/security groups and SSH admin allowlist
-iso27001	A.8.5	Secure authentication	AUTH-DEFAULT-DENY,AUTH-BYPASS,WG-PSK,PKI-CHAIN	Confirm two_factor policy covers all protected domains
+iso27001	A.8.5	Secure authentication	AUTH-DEFAULT-DENY,AUTH-BYPASS,WG-PSK,PKI-CHAIN,PROXY-MTLS	Confirm two_factor policy covers all protected domains
 iso27001	A.8.9	Configuration management	WG-HOOKS,WG-UNMANAGED,FILE-CONFIG	Change management and baseline documentation
 iso27001	A.8.15	Logging	-	Verify Authelia, WireGuard and firewall logs are collected, protected and retained
 iso27001	A.8.16	Monitoring activities	-	Verify connection-monitor/security-audit run on a schedule and alerts are handled

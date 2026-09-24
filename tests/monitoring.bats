@@ -328,6 +328,73 @@ EOF
     echo "$output" | jq -e '.checks[] | select(.id == "FILE-CA-KEY") | .status == "fail"'
 }
 
+check_of() {
+    jq -c --arg id "$1" '.checks[] | select(.id == $id)' <<<"$output"
+}
+
+@test "audit: MTLS=no is reported as not enforcing client certificates" {
+    good_host
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 0 ]
+    c="$(check_of PROXY-MTLS)"
+    jq -e '.status == "pass" and .severity == "info"' <<<"$c"
+    jq -e '.items[0] | test("does not request or check client certificates")' <<<"$c"
+    run --separate-stderr "$AUDIT" --verbose
+    [[ "$output" == *"[PASS] PROXY-MTLS"*"MTLS=no: nginx does not request or check client certificates"* ]]
+}
+
+@test "audit: MTLS=yes checks the generated snippet and treats a stale CRL as high/critical" {
+    good_host
+    export MTLS=yes
+    # No snippet deployed
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 1 ]
+    jq -e '.status == "fail" and .severity == "high" and (.items[0] | test("does not exist"))' <<<"$(check_of PROXY-MTLS)"
+
+    mkdir -p "$(dirname "$MTLS_SNIPPET")"
+    mtls_snippet yes >"$MTLS_SNIPPET"
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 0 ]
+    jq -e '.status == "pass"' <<<"$(check_of PROXY-MTLS)"
+    jq -e '.status == "pass"' <<<"$(check_of PKI-CRL)"
+
+    # Verification switched to optional, or only mentioned in a comment
+    sed -i 's/^ssl_verify_client .*/ssl_verify_client      optional; # ssl_verify_client on;/' "$MTLS_SNIPPET"
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 1 ]
+    jq -e '.status == "fail" and (.items | any(test("ssl_verify_client on")))' <<<"$(check_of PROXY-MTLS)"
+    mtls_snippet no >"$MTLS_SNIPPET"
+    run --separate-stderr "$AUDIT" --json
+    jq -e '.status == "fail" and (.items | length) == 4' <<<"$(check_of PROXY-MTLS)"
+    mtls_snippet yes >"$MTLS_SNIPPET"
+
+    # A deployed template with an HTTPS server that skips the snippet
+    mkdir -p "$CONFIG_PATH/nginx/templates"
+    printf 'server {\n    listen 443 ssl;\n}\n' >"$CONFIG_PATH/nginx/templates/app.conf.template"
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 1 ]
+    jq -e '.status == "fail" and (.items | length) == 1 and (.items[0] | test("app.conf.template"))' <<<"$(check_of PROXY-MTLS)"
+    cp "$REPO_ROOT"/config-examples/nginx/templates/* "$CONFIG_PATH/nginx/templates/"
+    rm "$CONFIG_PATH/nginx/templates/app.conf.template"
+    run --separate-stderr "$AUDIT" --json
+    jq -e '.status == "pass"' <<<"$(check_of PROXY-MTLS)"
+
+    # CRL close to nextUpdate: medium without MTLS, high with it
+    openssl ca -config "$PKI_CA_CNF" -passin "file:$PKI_CA_PASSFILE" -gencrl -crldays 3 -out "$PKI_CRL" 2>/dev/null
+    MTLS=no run --separate-stderr "$AUDIT" --json
+    jq -e '.status == "fail" and .severity == "medium"' <<<"$(check_of PKI-CRL)"
+    run --separate-stderr "$AUDIT" --json
+    [ "$status" -eq 1 ]
+    jq -e '.status == "fail" and .severity == "high" and (.items[0] | test("cert-renewal.sh renew"))' <<<"$(check_of PKI-CRL)"
+
+    # A world-readable .p12 is a key leak
+    pki_issue client alice >/dev/null 2>&1
+    echo pass | pki_export_p12 alice >/dev/null
+    chmod 644 "$PKI_CLIENTS_DIR/alice.p12"
+    run --separate-stderr "$AUDIT" --json
+    jq -e '.status == "fail" and (.items[0] | test("alice.p12 mode 644"))' <<<"$(check_of FILE-PKI-KEYS)"
+}
+
 # ==========================================================================
 # compliance-check.sh
 # ==========================================================================

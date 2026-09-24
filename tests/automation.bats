@@ -19,6 +19,7 @@ setup() {
     stub docker 'case "$*" in
   inspect*) echo "${DOCKER_RUNNING:-false}" ;;
   compose*" ps -q --status running "*) [[ "${DOCKER_RUNNING:-}" == true ]] && echo 0123456789ab ;;
+  *" kill "*|kill*) [[ -n "${DOCKER_KILL_FAIL:-}" ]] && exit 1 ;;
 esac
 exit 0'
     stub curl 'for a in "$@"; do [[ "$a" == /dev/fd/* ]] && cat "$a" >>"$STUB_LOG/curl.cfg"; done
@@ -154,10 +155,118 @@ calls() { cat "$STUB_LOG/$1" 2>/dev/null || true; }
     [ ! -d "$ZTVPN_BACKUP_DIR/certificates" ]
 }
 
+# CRL with a short lifetime, e.g. short_crl -crldays 3 / -crlhours 5.
+short_crl() {
+    openssl ca -config "$PKI_CA_CNF" -passin "file:$PKI_CA_PASSFILE" "$@" -gencrl -out "$PKI_CRL" 2>/dev/null
+}
+
+kills() { calls docker | grep -c 'kill -s SIGHUP' || true; }
+
+@test "cert check: reports days until the CRL's nextUpdate, warning and critical" {
+    load_lib
+    pki_init_ca 2>/dev/null
+    run "$CERT" check
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ crl\ +ca\.crl\ +(29|30)\ +ok ]]
+    short_crl -crldays 3
+    run "$CERT" check
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ crl\ +ca\.crl\ +(2|3)\ +warning ]]
+    run "$CERT" check --crl-days 2
+    [ "$status" -eq 0 ]
+    short_crl -crlhours 5
+    run "$CERT" check
+    [ "$status" -eq 2 ]
+    [[ "$output" =~ crl\ +ca\.crl\ +0\ +critical ]]
+    MTLS=yes run "$CERT" check
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"nginx rejects every client"* ]]
+    short_crl -crl_lastupdate 20200101000000Z -crl_nextupdate 20200102000000Z
+    run "$CERT" check
+    [ "$status" -eq 2 ]
+    [[ "$output" =~ crl\ +ca\.crl\ +-[0-9]+\ +expired ]]
+    rm "$PKI_CRL"
+    run "$CERT" check
+    [ "$status" -eq 2 ]
+    [[ "$output" =~ crl\ +ca\.crl\ +-\ +missing ]]
+}
+
+@test "cert renew: CRL near nextUpdate is regenerated; proxy reloaded once, and only with MTLS=yes" {
+    load_lib
+    pki_init_ca 2>/dev/null
+    touch "$ZTVPN_HOME/docker-compose.yml"
+    short_crl -crldays 3
+    num="$(openssl crl -in "$PKI_CRL" -noout -crlnumber)"
+    DOCKER_RUNNING=true run "$CERT" renew
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CRL regenerated"* ]]
+    [ "$(pki_crl_days_left)" -ge 29 ]
+    [ "$(openssl crl -in "$PKI_CRL" -noout -crlnumber)" != "$num" ]
+    [ "$(kills)" -eq 0 ]
+
+    # MTLS=yes: a renewed server certificate (which also revokes the old
+    # serial, i.e. a new CRL) and a stale CRL still mean one reload.
+    short_crl -crldays 3
+    pki_issue server vpn.example.com 5 >/dev/null 2>&1
+    MTLS=yes DOCKER_RUNNING=true run "$CERT" renew
+    [ "$status" -eq 0 ]
+    [ "$(kills)" -eq 1 ]
+    calls docker | grep -qx "compose -f $ZTVPN_HOME/docker-compose.yml --project-directory $ZTVPN_HOME kill -s SIGHUP nginx"
+
+    # Fresh CRL: nothing to do.
+    : >"$STUB_LOG/docker"
+    before="$(sha256sum <"$PKI_CRL")"
+    MTLS=yes DOCKER_RUNNING=true run "$CERT" renew
+    [ "$status" -eq 0 ]
+    [ "$(sha256sum <"$PKI_CRL")" = "$before" ]
+    [ "$(kills)" -eq 0 ]
+
+    # --crl-days makes the window configurable; --dry-run only reports.
+    MTLS=yes DOCKER_RUNNING=true run "$CERT" renew --crl-days 40 --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would regenerate the CRL"* ]]
+    [ "$(sha256sum <"$PKI_CRL")" = "$before" ]
+    MTLS=yes DOCKER_RUNNING=true DOCKER_KILL_FAIL=1 run "$CERT" renew --crl-days 40
+    [ "$status" -eq 1 ]
+    [ "$(sha256sum <"$PKI_CRL")" != "$before" ]
+    [[ "$output" == *"reload it manually"* ]]
+}
+
+@test "cert crl: regenerates unconditionally, reloads only with MTLS=yes and without --no-reload" {
+    load_lib
+    pki_init_ca 2>/dev/null
+    touch "$ZTVPN_HOME/docker-compose.yml"
+    num="$(openssl crl -in "$PKI_CRL" -noout -crlnumber)"
+    DOCKER_RUNNING=true run "$CERT" crl
+    [ "$status" -eq 0 ]
+    [ "$(openssl crl -in "$PKI_CRL" -noout -crlnumber)" != "$num" ]
+    [[ "$output" == *"no reload needed"* ]]
+    [ "$(kills)" -eq 0 ]
+    MTLS=yes DOCKER_RUNNING=true run "$CERT" crl
+    [ "$status" -eq 0 ]
+    [ "$(kills)" -eq 1 ]
+    MTLS=yes DOCKER_RUNNING=true run "$CERT" crl --no-reload
+    [ "$status" -eq 0 ]
+    [ "$(kills)" -eq 1 ]
+    # Stopped proxy: nothing to signal, not an error.
+    MTLS=yes DOCKER_RUNNING=false run "$CERT" crl
+    [ "$status" -eq 0 ]
+    [ "$(kills)" -eq 1 ]
+    MTLS=yes DOCKER_RUNNING=true DOCKER_KILL_FAIL=1 run "$CERT" crl
+    [ "$status" -eq 1 ]
+    run "$CERT" --help
+    [[ "$output" == *"cert-renewal.sh renew"* ]]
+    [[ "$output" == *"* * * root "* ]]
+}
+
 @test "cert renewal rejects bad arguments" {
     run "$CERT" check --days abc
     [ "$status" -ne 0 ]
     run "$CERT" frobnicate
+    [ "$status" -ne 0 ]
+    run "$CERT" renew --crl-days x
+    [ "$status" -ne 0 ]
+    MTLS=maybe run "$CERT" check
     [ "$status" -ne 0 ]
 }
 
@@ -274,6 +383,31 @@ calls() { cat "$STUB_LOG/$1" 2>/dev/null || true; }
     grep -q "PresharedKey" "$WG_CONF"
     [ -f "$WG_CLIENTS_DIR/carol--laptop/private.key" ]
     calls nft | grep -qx "delete element inet ztvpn quarantine4 { $ip }"
+}
+
+@test "threat: compromised-device revokes the cert, archives key and .p12, reloads nginx with MTLS=yes" {
+    ztvpn_fake_wg_server
+    load_lib
+    pki_init_ca 2>/dev/null
+    wg_provision_peer carol--laptop >/dev/null
+    pki_issue client carol--laptop >/dev/null 2>&1
+    echo bundle-pass | pki_export_p12 carol--laptop >/dev/null
+    serial="$(pki_valid_serials carol--laptop)"
+    touch "$ZTVPN_HOME/docker-compose.yml"
+    MTLS=yes DOCKER_RUNNING=true run --separate-stderr "$THREAT" --type compromised-device --device carol--laptop
+    [ "$status" -eq 0 ]
+    id="$output"
+    [ -z "$(pki_valid_serials carol--laptop)" ]
+    openssl crl -in "$PKI_CRL" -noout -text | grep -q "$serial"
+    [ ! -e "$PKI_CLIENTS_DIR/carol--laptop.p12" ]
+    [ ! -e "$PKI_CLIENTS_DIR/carol--laptop.key" ]
+    archive="$ZTVPN_BACKUP_DIR/revoked/carol--laptop-$id/certs"
+    [ -f "$archive/carol--laptop.p12" ]
+    [ -f "$archive/carol--laptop.key" ]
+    [ "$(stat -c %a "$ZTVPN_BACKUP_DIR/revoked")" = 700 ]
+    [ "$(kills)" -eq 1 ]
+    jq -e '.actions[] | select(.action == "revoke-cert") | .status == "ok" and (.detail | test("archived"))' \
+        "$ZTVPN_STATE_DIR/incidents/$id.json"
 }
 
 @test "threat: compromised-device by unknown peer fails cleanly" {

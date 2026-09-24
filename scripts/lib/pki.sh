@@ -4,7 +4,7 @@
 # Layout under $PKI_DIR:
 #   ca/ca.crt  ca/private/ca.key (encrypted with $PKI_CA_PASSFILE)
 #   ca/openssl.cnf ca/index.txt ca/serial ca/crlnumber ca/newcerts/
-#   server/<name>.key|crt   clients/<name>.key|crt   crl/ca.crl
+#   server/<name>.key|crt   clients/<name>.key|crt|p12   crl/ca.crl
 #
 # Every certificate goes through "openssl ca", so index.txt is the complete
 # record of what was issued and the CRL can revoke anything.
@@ -251,12 +251,63 @@ pki_revoke() {
     pki_gen_crl
 }
 
+# Writes a new CRL (valid for default_crl_days) atomically. With MTLS=yes
+# the TLS proxy is reloaded afterwards so it enforces the new CRL
+# (proxy_crl_changed; set PKI_CRL_RELOAD=no to reload yourself).
 pki_gen_crl() {
     local -a passin
     mapfile -t passin < <(_pki_passin)
     mkdir -p "$(dirname "$PKI_CRL")"
+    # Always a new file renamed into place: nginx (1.27+) caches CRLs across
+    # reloads keyed by inode and mtime, so rewriting the same inode within
+    # one second would leave a revoked certificate accepted.
     openssl ca -config "$PKI_CA_CNF" "${passin[@]}" -gencrl -out "$PKI_CRL.tmp" &&
-        chmod 644 "$PKI_CRL.tmp" && mv -f "$PKI_CRL.tmp" "$PKI_CRL"
+        chmod 644 "$PKI_CRL.tmp" && mv -f "$PKI_CRL.tmp" "$PKI_CRL" || return 1
+    proxy_crl_changed
+}
+
+# Seconds until the CRL's nextUpdate (negative once it has passed).
+pki_crl_seconds_left() {
+    local crl="${1:-$PKI_CRL}" next epoch
+    next="$(openssl crl -in "$crl" -noout -nextupdate 2>/dev/null)" || return 1
+    next="${next#nextUpdate=}"
+    [[ -n "$next" && "$next" != NONE ]] || return 1
+    epoch="$(date -d "$next" +%s 2>/dev/null)" || return 1
+    echo $((epoch - $(date +%s)))
+}
+
+# Whole days until nextUpdate, rounded down (-1 once it has passed).
+pki_crl_days_left() {
+    local s
+    s="$(pki_crl_seconds_left "$@")" || return 1
+    if ((s < 0)); then
+        echo $(((s - 86399) / 86400))
+    else
+        echo $((s / 86400))
+    fi
+}
+
+# pki_export_p12 <name>: bundles clients/<name>.key, <name>.crt and the CA
+# certificate into clients/<name>.p12 (0600) and prints its path. The
+# export password is read from stdin (first line), so it never appears on
+# a command line.
+pki_export_p12() {
+    local name="$1" dir="$PKI_CLIENTS_DIR" tmp
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { error "Invalid certificate name: $name"; return 1; }
+    [[ -f "$dir/$name.key" && -f "$dir/$name.crt" ]] || { error "No key/certificate for $name in $dir"; return 1; }
+    local -a alg=()
+    if [[ "$PKI_P12_COMPAT" == yes ]]; then
+        alg=(-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1)
+    fi
+    tmp="$(mktemp "$dir/.$name.p12.XXXXXX")" || return 1
+    if ! openssl pkcs12 -export -in "$dir/$name.crt" -inkey "$dir/$name.key" \
+        -certfile "$PKI_CA_CERT" -name "$name" "${alg[@]}" -passout stdin -out "$tmp"; then
+        rm -f "$tmp"
+        error "Could not create the PKCS#12 bundle for $name"
+        return 1
+    fi
+    chmod 600 "$tmp" && mv -f "$tmp" "$dir/$name.p12" || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$dir/$name.p12"
 }
 
 # Seconds until the certificate expires (negative if expired).
@@ -270,7 +321,8 @@ pki_seconds_left() {
 pki_days_left() {
     local s
     s="$(pki_seconds_left "$1")" || return 1
-    echo $((s / 86400))
+    # Floor division, so a certificate that expired an hour ago is -1, not 0.
+    if ((s >= 0)); then echo $((s / 86400)); else echo $((-((-s + 86399) / 86400))); fi
 }
 
 # True if the cert is signed by our CA and not revoked according to the CRL.

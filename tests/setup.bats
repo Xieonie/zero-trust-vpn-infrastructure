@@ -422,6 +422,59 @@ write_config() {
     [ "$(authelia_list_users | wc -l)" -eq 1 ]
 }
 
+@test "initial-setup: snippets/mtls.conf is generated from MTLS on every run" {
+    fake_repo
+    write_config
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -eq 0 ]
+    lib
+    snip="$CONFIG_PATH/nginx/snippets/mtls.conf"
+    [ "$snip" = "$MTLS_SNIPPET" ]
+    [ "$(stat -c %U:%a "$snip")" = root:644 ]
+    cmp "$snip" "$REPO_ROOT/config-examples/nginx/snippets/mtls.conf"
+    ! grep -q '^ssl_verify_client' "$snip" || false
+    grep -q 'include /etc/nginx/snippets/mtls.conf;' "$CONFIG_PATH/nginx/templates/auth.conf.template"
+    [[ "$output" == *"MTLS=no: nginx does not check client certificates"* ]]
+
+    # MTLS=yes: regenerated (a local edit is not kept), no "differs" warning
+    printf 'MTLS=yes\n' >>"$ZTVPN_CONFIG"
+    echo '# local edit' >>"$snip"
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"mtls.conf differs"* ]]
+    ! grep -q 'local edit' "$snip" || false
+    grep -qx 'ssl_verify_client      on;' "$snip"
+    grep -qx 'ssl_client_certificate /etc/nginx/client-ca/ca.crt;' "$snip"
+    grep -qx 'ssl_crl                /etc/nginx/crl/ca.crl;' "$snip"
+    # compose mounts exactly these host files
+    [ "$PKI_CA_CERT" = "$CERTS_PATH/ca/ca.crt" ]
+    [ "$PKI_CRL" = "$CERTS_PATH/crl/ca.crl" ]
+
+    # A locally kept template whose HTTPS server lacks the include would
+    # silently skip the client certificate check: refused.
+    printf 'server {\n    listen 443 ssl;\n    server_name app.corp.test;\n}\n' >"$CONFIG_PATH/nginx/templates/app.conf.template"
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"app.conf.template"* ]]
+    rm "$CONFIG_PATH/nginx/templates/app.conf.template"
+
+    sed -i 's/^MTLS=yes$/MTLS=no/' "$ZTVPN_CONFIG"
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -eq 0 ]
+    cmp "$snip" "$REPO_ROOT/config-examples/nginx/snippets/mtls.conf"
+
+    before="$(sha "$snip")"
+    sed -i 's/^MTLS=no$/MTLS=on/' "$ZTVPN_CONFIG"
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MTLS"*"must be yes or no"* ]]
+    sed -i 's/^MTLS=on$/MTLS=yes/' "$ZTVPN_CONFIG"
+    PKI_CRL="$BATS_TEST_TMPDIR/elsewhere.crl" run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MTLS=yes needs"* ]]
+    [ "$(sha "$snip")" = "$before" ]
+}
+
 @test "initial-setup: rejects values that would be unsafe in .env" {
     fake_repo
     write_config
