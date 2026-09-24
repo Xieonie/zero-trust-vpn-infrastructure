@@ -343,7 +343,7 @@ EOF
 }
 
 write_config() {
-    printf 'DOMAIN=corp.test\nAUTH_DOMAIN=auth.corp.test\nVPN_ENDPOINT=vpn.corp.test\nTZ=Europe/Berlin\n' >"$ZTVPN_CONFIG"
+    printf 'DOMAIN=corp.test\nAUTH_DOMAIN=auth.corp.test\nVPN_ENDPOINT=vpn.corp.test\nTZ=Europe/Berlin\nPROXY_BIND_ADDR=10.0.1.1\n' >"$ZTVPN_CONFIG"
     chmod 600 "$ZTVPN_CONFIG"
 }
 
@@ -408,6 +408,7 @@ write_config() {
     grep -qx 'TZ=Europe/Berlin' "$env"
     grep -qx "AUTHELIA_DIR=$AUTHELIA_DIR" "$env"
     grep -qx "CERTS_PATH=$CERTS_PATH" "$env"
+    grep -qx "PROXY_BIND_ADDR=10.0.1.1" "$env"
     for s in "$AUTHELIA_SECRETS_DIR"/* "$PKI_CA_PASSFILE"; do
         ! grep -qF "$(<"$s")" "$env" || false
     done
@@ -427,4 +428,15 @@ write_config() {
     TZ='Europe/Berlin $(id)' run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
     [ "$status" -ne 0 ]
     [[ "$output" == *"not allowed in .env"* ]]
+}
+
+@test "initial-setup: refuses to deploy without a proxy address in SERVICES_SUBNET" {
+    fake_repo
+    write_config
+    sed -i '/^PROXY_BIND_ADDR=/d' "$ZTVPN_CONFIG"
+    printf 'SERVICES_SUBNET=203.0.113.0/24\n' >>"$ZTVPN_CONFIG"
+    run "$FAKE/scripts/setup/initial-setup.sh" --skip-packages --skip-docker --non-interactive
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"PROXY_BIND_ADDR"* ]]
+    [ ! -e "$PKI_CA_CERT" ]
 }

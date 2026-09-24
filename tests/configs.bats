@@ -116,9 +116,9 @@ authelia_validate() {
     done
 }
 
-@test "compose: only nginx publishes ports, and only 80/443" {
+@test "compose: only nginx publishes ports, only 80/443, never on all interfaces" {
     [ "$(yq '[.services | to_entries[] | select(.value.ports) | .key] | join(",")' "$COMPOSE")" = nginx ]
-    [ "$(yq '.services.nginx.ports | join(",")' "$COMPOSE")" = "80:80,443:443" ]
+    [ "$(yq '.services.nginx.ports | join(",")' "$COMPOSE")" = '${PROXY_BIND_ADDR:?set PROXY_BIND_ADDR in .env}:80:80,${PROXY_BIND_ADDR}:443:443' ]
     [ "$(yq '[.services[] | select(.network_mode == "host")] | length' "$COMPOSE")" = 0 ]
 }
 

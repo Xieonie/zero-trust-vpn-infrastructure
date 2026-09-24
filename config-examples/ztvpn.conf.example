@@ -18,6 +18,9 @@ VPN_SUBNET=10.8.0.0/24
 VPN_SERVER_IP=10.8.0.1
 # Internal services reachable through the tunnel (reverse proxy etc.)
 SERVICES_SUBNET=10.0.1.0/24
+# This host's address in SERVICES_SUBNET; nginx publishes 80/443 only there.
+# Empty = first local IPv4 address inside SERVICES_SUBNET.
+PROXY_BIND_ADDR=
 # Leave empty to auto-detect from the default route
 EXTERNAL_INTERFACE=
 # What clients route through the tunnel. Split tunnel by default.
@@ -34,8 +37,9 @@ WG_PORT=51820
 # Empty = SSH open to everyone (rate limited), with a warning.
 ADMIN_ALLOWLIST=
 SSH_PORT=22
-# TCP ports open on the host from anywhere (reverse proxy)
-PUBLIC_TCP_PORTS=80,443
+# TCP ports open on the host from anywhere. Only for services running natively
+# on the host; the Docker nginx is bound to PROXY_BIND_ADDR instead.
+PUBLIC_TCP_PORTS=
 # Ports VPN clients may reach in SERVICES_SUBNET (the Authelia-protected proxy)
 SERVICES_PORTS=443
 # Ports VPN clients may reach on VPN_SERVER_IP itself (e.g. 53 if you run DNS)

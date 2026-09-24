@@ -250,3 +250,17 @@ CONF
     mv "$QUARANTINE_DIR/mallory" "$QUARANTINE_DIR/mallory.released-20260101T000000Z"
     [ "$(wg_next_free_ip)" = "10.8.0.2" ]
 }
+
+@test "proxy_bind_addr validates configured address against SERVICES_SUBNET" {
+    load_lib
+    PROXY_BIND_ADDR=10.0.1.5
+    [ "$(proxy_bind_addr)" = "10.0.1.5" ]
+    PROXY_BIND_ADDR=0.0.0.0
+    run proxy_bind_addr
+    [ "$status" -ne 0 ]
+    PROXY_BIND_ADDR=
+    SERVICES_SUBNET=203.0.113.0/24
+    run proxy_bind_addr
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"set PROXY_BIND_ADDR"* ]]
+}

@@ -135,6 +135,9 @@ check_settings() {
         read -r -p "$example is a placeholder. Continue with the example values (test install only)? [y/N] " answer
         [[ "$answer" == [yY] ]] || die "Edit $ZTVPN_CONFIG and run again."
     fi
+    # nginx is published only on this address (Docker ports bypass nftables).
+    PROXY_ADDR="$(proxy_bind_addr)" ||
+        die "Give this host an address in SERVICES_SUBNET or set PROXY_BIND_ADDR in $ZTVPN_CONFIG"
 }
 
 # --------------------------------------------------------------------------
@@ -146,7 +149,7 @@ install_packages() {
     info "Installing base packages"
     apt-get update
     apt-get install -y --no-install-recommends \
-        wireguard-tools nftables openssl jq argon2 qrencode \
+        wireguard-tools nftables conntrack openssl jq argon2 qrencode \
         ca-certificates curl iproute2 util-linux
     ((SKIP_DOCKER)) || install_docker
     install_yq
@@ -293,6 +296,7 @@ deploy_compose() {
         DOMAIN "$DOMAIN"
         AUTH_DOMAIN "$AUTH_DOMAIN"
         VPN_SUBNET "$VPN_SUBNET"
+        PROXY_BIND_ADDR "$PROXY_ADDR"
         CONFIG_PATH "$CONFIG_PATH"
         CERTS_PATH "$CERTS_PATH"
         AUTHELIA_DIR "$AUTHELIA_DIR"

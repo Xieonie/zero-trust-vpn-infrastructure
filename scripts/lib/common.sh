@@ -116,6 +116,7 @@ VPN_ENDPOINT="${VPN_ENDPOINT:-vpn.$DOMAIN}"
 VPN_SUBNET="${VPN_SUBNET:-10.8.0.0/24}"
 VPN_SERVER_IP="${VPN_SERVER_IP:-10.8.0.1}"
 SERVICES_SUBNET="${SERVICES_SUBNET:-10.0.1.0/24}"
+PROXY_BIND_ADDR="${PROXY_BIND_ADDR:-}"
 EXTERNAL_INTERFACE="${EXTERNAL_INTERFACE:-}"
 # What clients route through the tunnel. Split tunnel by default.
 CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS:-$VPN_SUBNET, $SERVICES_SUBNET}"
@@ -358,6 +359,29 @@ inventory_edit() {
     shift
     out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
     printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
+}
+
+# Address nginx publishes on: PROXY_BIND_ADDR, or the first local IPv4
+# address inside SERVICES_SUBNET. Fails if neither exists.
+proxy_bind_addr() {
+    if [[ -n "$PROXY_BIND_ADDR" ]]; then
+        validate_ipv4 "$PROXY_BIND_ADDR" && ip_in_cidr "$PROXY_BIND_ADDR" "$SERVICES_SUBNET" || {
+            error "PROXY_BIND_ADDR $PROXY_BIND_ADDR is not an IPv4 address inside $SERVICES_SUBNET"
+            return 1
+        }
+        printf '%s\n' "$PROXY_BIND_ADDR"
+        return 0
+    fi
+    local addr
+    while read -r addr; do
+        addr="${addr%/*}"
+        if ip_in_cidr "$addr" "$SERVICES_SUBNET"; then
+            printf '%s\n' "$addr"
+            return 0
+        fi
+    done < <(ip -o -4 addr show 2>/dev/null | awk '{print $4}')
+    error "No local address inside SERVICES_SUBNET ($SERVICES_SUBNET); set PROXY_BIND_ADDR"
+    return 1
 }
 
 # shellcheck source=scripts/lib/wireguard.sh

@@ -136,9 +136,13 @@ services:
       # Only these are substituted in /etc/nginx/templates, so nginx's own
       # $variables stay untouched.
       NGINX_ENVSUBST_FILTER: "^(DOMAIN|AUTH_DOMAIN|VPN_SUBNET)$$"
+    # Bound to this host's address in SERVICES_SUBNET only. Docker-published
+    # ports bypass the nftables input chain, so binding to 0.0.0.0 would put
+    # the proxy on the internet; this way only VPN clients (and the LAN of
+    # SERVICES_SUBNET) can reach it.
     ports:
-      - "80:80"
-      - "443:443"
+      - "${PROXY_BIND_ADDR:?set PROXY_BIND_ADDR in .env}:80:80"
+      - "${PROXY_BIND_ADDR}:443:443"
     volumes:
       - ${CONFIG_PATH:?set CONFIG_PATH in .env}/nginx/templates:/etc/nginx/templates:ro
       - ${CONFIG_PATH}/nginx/snippets:/etc/nginx/snippets:ro
