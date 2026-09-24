@@ -239,12 +239,13 @@ split_csv() {
 
 # Lowercase, starts with a letter, no dots (dots would be regex wildcards
 # in any legacy tool and make "a.b" ambiguous with peer names).
+# "--" is reserved as the user/device separator in peer names.
 validate_username() {
-    [[ "$1" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]
+    [[ "$1" =~ ^[a-z][a-z0-9_-]{1,31}$ && "$1" != *--* && "$1" != *- ]]
 }
 
 validate_device_name() {
-    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ && "$1" != *--* && "$1" != *- ]]
 }
 
 # Peer names are "<user>" or "<user>--<device>".

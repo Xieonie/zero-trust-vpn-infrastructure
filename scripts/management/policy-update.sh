@@ -1,524 +1,584 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Edits the live Authelia access-control rules and user group memberships.
+#
+# Every change is backed up first, validated afterwards and rolled back if
+# validation fails. Values reach yq only through the environment
+# (strenv/from_json), never through the expression text.
+set -Eeuo pipefail
 
-# Zero Trust VPN Infrastructure - Policy Update Script
-# This script manages and updates access policies for users and devices
-# in the Zero Trust VPN infrastructure
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
+AUTHELIA_CONFIG="${AUTHELIA_CONFIG:-$AUTHELIA_DIR/configuration.yml}"
+POLICY_BACKUP_DIR="${POLICY_BACKUP_DIR:-$ZTVPN_BACKUP_DIR/policy}"
+# auto: docker if usable, else structural checks only | docker | yq
+AUTHELIA_VALIDATE="${AUTHELIA_VALIDATE:-auto}"
+AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-authelia}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
-CONFIG_DIR="$PROJECT_ROOT/config-examples"
-AUTHELIA_CONFIG="$CONFIG_DIR/authelia"
-POLICY_DIR="$PROJECT_ROOT/policies"
-BACKUP_DIR="$PROJECT_ROOT/backups/policies"
-
-# Policy files
-ACCESS_CONTROL_FILE="$AUTHELIA_CONFIG/access-control.yml"
-USERS_DB_FILE="$AUTHELIA_CONFIG/users_database.yml"
-DEVICE_INVENTORY="$PROJECT_ROOT/device-inventory.json"
-
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
-}
-
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
-}
-
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-    exit 1
-}
-
-info() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
-}
-
-# Display usage information
 usage() {
-    cat << EOF
-Usage: $0 [COMMAND] [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") <command> [options]
 
-Zero Trust VPN Policy Management Script
+Works on the live Authelia configuration:
+  config:   $AUTHELIA_CONFIG
+  users DB: $AUTHELIA_USERS_DB
 
-COMMANDS:
-    update-user-access USER LEVEL    Update user access level
-    update-device-policy DEVICE POLICY    Update device-specific policy
-    add-resource RESOURCE GROUPS    Add new protected resource
-    remove-resource RESOURCE        Remove protected resource
-    list-policies                   List all current policies
-    validate-config                 Validate policy configuration
-    backup-policies                 Backup current policies
-    restore-policies BACKUP_FILE    Restore policies from backup
-    sync-policies                   Synchronize policies across services
+Access-control rules:
+  list-rules [--json]
+  add-rule --domain D --policy one_factor|two_factor|deny
+           [--subject group:G|user:U ...] [--network NAME|CIDR ...]
+           [--resource REGEX ...] [--position N]
+           Subjects are OR-ed. Rules are evaluated top-down; default is to append.
+  remove-rule --index N | --domain D
+           --domain removes D from every rule; rules left without a domain are deleted.
 
-OPTIONS:
-    --dry-run                       Show what would be done without making changes
-    --force                         Force operation without confirmation
-    -v, --verbose                   Enable verbose output
-    -h, --help                      Show this help message
+Group membership (file backend; groups must be in KNOWN_GROUPS):
+  set-groups <user> g1,g2 [--exact]
+           Without --exact the user keeps the default groups ($DEFAULT_USER_GROUPS)
+           they already have.
+  add-group <user> <group>
+  remove-group <user> <group>
 
-ACCESS LEVELS:
-    admin       Full access to all resources
-    standard    Access to standard user resources
-    limited     Restricted access to basic resources
-    guest       Minimal access for temporary users
+Maintenance:
+  validate               Check config and users DB (docker validate-config if available)
+  backup                 Copy config and users DB to $POLICY_BACKUP_DIR/<timestamp>
+  restore <backup>       Restore a backup (name or path under $POLICY_BACKUP_DIR)
 
-EXAMPLES:
-    $0 update-user-access john.doe admin
-    $0 add-resource "https://internal.example.com" "admin,standard"
-    $0 update-device-policy laptop-work "high-security"
-    $0 backup-policies
-    $0 validate-config
+Global options:
+  --restart              Restart the Authelia container ($AUTHELIA_CONTAINER) after a
+                         successful config change (Authelia does not reload
+                         configuration.yml by itself; the users DB is reloaded
+                         when "watch: true" is set)
+  -h, --help
 
+Known groups: $KNOWN_GROUPS
 EOF
 }
 
-# Parse command line arguments
-parse_args() {
-    COMMAND="${1:-}"
-    shift || true
+need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
 
-    case "$COMMAND" in
-        update-user-access)
-            USER_TARGET="${1:-}"
-            NEW_ACCESS_LEVEL="${2:-}"
-            [[ -z "$USER_TARGET" ]] && error "Username required"
-            [[ -z "$NEW_ACCESS_LEVEL" ]] && error "Access level required"
-            shift 2 || true
-            ;;
-        update-device-policy)
-            DEVICE_TARGET="${1:-}"
-            NEW_POLICY="${2:-}"
-            [[ -z "$DEVICE_TARGET" ]] && error "Device ID required"
-            [[ -z "$NEW_POLICY" ]] && error "Policy name required"
-            shift 2 || true
-            ;;
-        add-resource)
-            RESOURCE_URL="${1:-}"
-            ALLOWED_GROUPS="${2:-}"
-            [[ -z "$RESOURCE_URL" ]] && error "Resource URL required"
-            [[ -z "$ALLOWED_GROUPS" ]] && error "Allowed groups required"
-            shift 2 || true
-            ;;
-        remove-resource)
-            RESOURCE_URL="${1:-}"
-            [[ -z "$RESOURCE_URL" ]] && error "Resource URL required"
-            shift || true
-            ;;
-        list-policies|validate-config|backup-policies|sync-policies)
-            # No additional arguments needed
-            ;;
-        restore-policies)
-            BACKUP_FILE="${1:-}"
-            [[ -z "$BACKUP_FILE" ]] && error "Backup file required"
-            shift || true
-            ;;
-        ""|"-h"|"--help")
-            usage
-            exit 0
-            ;;
-        *)
-            error "Unknown command: $COMMAND"
-            ;;
+COMMAND="${1:-}"
+[[ -n "$COMMAND" ]] || { usage >&2; exit 1; }
+shift
+case "$COMMAND" in
+    -h|--help|help) usage; exit 0 ;;
+    list-rules|add-rule|remove-rule|set-groups|add-group|remove-group|validate|backup|restore) ;;
+    *) die "Unknown command: $COMMAND (see --help)" ;;
+esac
+
+DOMAIN_ARG="" POLICY="" POSITION="" INDEX="" EXACT=0 JSON=0 RESTART=0
+SUBJECTS=() NETWORKS=() RESOURCES=() ARGS=()
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --domain)   need_value "$@"; DOMAIN_ARG="$2"; shift 2 ;;
+        --policy)   need_value "$@"; POLICY="$2"; shift 2 ;;
+        --subject)  need_value "$@"; SUBJECTS+=("$2"); shift 2 ;;
+        --network)  need_value "$@"; NETWORKS+=("$2"); shift 2 ;;
+        --resource) need_value "$@"; RESOURCES+=("$2"); shift 2 ;;
+        --position) need_value "$@"; POSITION="$2"; shift 2 ;;
+        --index)    need_value "$@"; INDEX="$2"; shift 2 ;;
+        --exact)    EXACT=1; shift ;;
+        --json)     JSON=1; shift ;;
+        --restart)  RESTART=1; shift ;;
+        --) shift; ARGS+=("$@"); break ;;
+        -*) die "Unknown option: $1 (see --help)" ;;
+        *) ARGS+=("$1"); shift ;;
     esac
+done
 
-    # Parse remaining options
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            --force)
-                FORCE=true
-                shift
-                ;;
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                error "Unknown option: $1"
-                ;;
-        esac
+require_cmd jq yq
+require_yq || exit 1
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+is_known_group() {
+    local g
+    while IFS= read -r g; do [[ "$g" == "$1" ]] && return 0; done < <(split_csv "$KNOWN_GROUPS")
+    return 1
+}
+
+check_username() {
+    validate_username "$1" && [[ "$1" != *--* ]] || die "Invalid username: $1"
+}
+
+require_file_backend() {
+    [[ "$AUTHELIA_BACKEND" == file ]] ||
+        die "AUTHELIA_BACKEND=$AUTHELIA_BACKEND: group membership is managed in the directory, not here"
+    [[ -f "$AUTHELIA_USERS_DB" ]] || die "Users database $AUTHELIA_USERS_DB not found"
+}
+
+require_config() {
+    [[ -f "$AUTHELIA_CONFIG" ]] || die "Authelia configuration $AUTHELIA_CONFIG not found"
+}
+
+audit() {
+    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
+        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
+            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
+}
+
+rules_json() {
+    yq -o=json -I0 '.access_control.rules // []' "$AUTHELIA_CONFIG"
+}
+
+# Applies a constant yq expression to a file in place (atomically, same mode).
+# Values must be passed via the environment.
+yq_edit() {
+    local expr="$1" file="$2" mode out
+    mode="$(stat -c %a "$file")"
+    out="$(yq "$expr" "$file")" || return 1
+    printf '%s\n' "$out" | atomic_write "$file" "$mode"
+}
+
+# Copies the current config and users DB; prints the backup directory.
+make_backup() {
+    local dir f
+    dir="$POLICY_BACKUP_DIR/$(date +%Y%m%dT%H%M%S.%N)"
+    (umask 077; mkdir -p "$dir") || return 1
+    chmod 700 "$POLICY_BACKUP_DIR"
+    for f in "$AUTHELIA_CONFIG" "$AUTHELIA_USERS_DB"; do
+        [[ -f "$f" ]] && cp -p "$f" "$dir/$(basename "$f")"
     done
-
-    # Set defaults
-    DRY_RUN="${DRY_RUN:-false}"
-    FORCE="${FORCE:-false}"
-    VERBOSE="${VERBOSE:-false}"
+    printf '%s\n' "$dir"
 }
 
-# Check prerequisites
-check_prerequisites() {
-    log "Checking prerequisites..."
-
-    # Check required commands
-    local required_commands=("yq" "jq" "systemctl")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            error "Required command not found: $cmd"
-        fi
+restore_from() {
+    local dir="$1" f dest mode rc=0
+    for f in "$AUTHELIA_CONFIG" "$AUTHELIA_USERS_DB"; do
+        [[ -f "$dir/$(basename "$f")" ]] || continue
+        dest="$f"
+        mode="$(stat -c %a "$dir/$(basename "$f")")"
+        mkdir -p "$(dirname "$dest")"
+        atomic_write "$dest" "$mode" <"$dir/$(basename "$f")" || rc=1
     done
-
-    # Create directories if they don't exist
-    mkdir -p "$POLICY_DIR" "$BACKUP_DIR"
-
-    # Check if configuration files exist
-    if [[ ! -f "$ACCESS_CONTROL_FILE" ]]; then
-        warn "Access control file not found: $ACCESS_CONTROL_FILE"
-    fi
-
-    if [[ ! -f "$USERS_DB_FILE" ]]; then
-        warn "Users database file not found: $USERS_DB_FILE"
-    fi
+    return "$rc"
 }
 
-# Backup current policies
-backup_policies() {
-    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_file="$BACKUP_DIR/policies_backup_$backup_timestamp.tar.gz"
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
 
-    log "Creating policy backup..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would create backup at $backup_file"
-        return
-    fi
-
-    tar -czf "$backup_file" -C "$PROJECT_ROOT" \
-        "config-examples/authelia/" \
-        "device-inventory.json" \
-        "policies/" 2>/dev/null || true
-
-    log "Policies backed up to: $backup_file"
-    echo "$backup_file"
-}
-
-# Validate configuration files
-validate_config() {
-    log "Validating policy configuration..."
-
-    local errors=0
-
-    # Validate YAML files
-    if [[ -f "$ACCESS_CONTROL_FILE" ]]; then
-        if ! yq eval '.' "$ACCESS_CONTROL_FILE" >/dev/null 2>&1; then
-            error "Invalid YAML in access control file: $ACCESS_CONTROL_FILE"
-            ((errors++))
-        else
-            info "Access control file is valid"
-        fi
-    fi
-
-    if [[ -f "$USERS_DB_FILE" ]]; then
-        if ! yq eval '.' "$USERS_DB_FILE" >/dev/null 2>&1; then
-            error "Invalid YAML in users database file: $USERS_DB_FILE"
-            ((errors++))
-        else
-            info "Users database file is valid"
-        fi
-    fi
-
-    # Validate JSON files
-    if [[ -f "$DEVICE_INVENTORY" ]]; then
-        if ! jq empty "$DEVICE_INVENTORY" 2>/dev/null; then
-            error "Invalid JSON in device inventory: $DEVICE_INVENTORY"
-            ((errors++))
-        else
-            info "Device inventory file is valid"
-        fi
-    fi
-
-    if [[ $errors -eq 0 ]]; then
-        log "All configuration files are valid"
-        return 0
-    else
-        error "Found $errors configuration errors"
+# Structural checks that do not need Authelia itself.
+check_config_structure() {
+    local errors=0 net_names rules
+    if ! yq -e '.' "$AUTHELIA_CONFIG" >/dev/null 2>&1; then
+        error "$AUTHELIA_CONFIG is not valid YAML"
         return 1
     fi
-}
-
-# Update user access level
-update_user_access() {
-    local username="$USER_TARGET"
-    local new_level="$NEW_ACCESS_LEVEL"
-
-    log "Updating access level for user: $username to $new_level"
-
-    # Validate access level
-    if [[ ! "$new_level" =~ ^(admin|standard|limited|guest)$ ]]; then
-        error "Invalid access level. Must be: admin, standard, limited, or guest"
+    if ! yq -e '(.access_control | type) == "!!map"' "$AUTHELIA_CONFIG" >/dev/null 2>&1; then
+        error "No access_control section in $AUTHELIA_CONFIG"
+        return 1
     fi
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would update $username access level to $new_level"
-        return
-    fi
-
-    # Check if user exists
-    if ! yq eval ".users | has(\"$username\")" "$USERS_DB_FILE" | grep -q "true"; then
-        error "User $username not found in database"
-    fi
-
-    # Backup before changes
-    local backup_file=$(backup_policies)
-
-    # Update user groups in Authelia
-    yq eval ".users.\"$username\".groups = [\"$new_level\"]" -i "$USERS_DB_FILE"
-
-    # Update device inventory
-    if [[ -f "$DEVICE_INVENTORY" ]]; then
-        jq "(.devices[] | select(.username == \"$username\") | .access_level) = \"$new_level\"" \
-           "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-    fi
-
-    log "User access level updated successfully"
-    info "Backup created: $backup_file"
-}
-
-# Add new protected resource
-add_resource() {
-    local resource_url="$RESOURCE_URL"
-    local allowed_groups="$ALLOWED_GROUPS"
-
-    log "Adding new protected resource: $resource_url"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would add resource $resource_url for groups: $allowed_groups"
-        return
-    fi
-
-    # Backup before changes
-    local backup_file=$(backup_policies)
-
-    # Convert comma-separated groups to array
-    IFS=',' read -ra groups_array <<< "$allowed_groups"
-
-    # Create new rule entry
-    local new_rule=$(cat << EOF
-{
-  "domain": "$(echo "$resource_url" | sed 's|https\?://||' | cut -d'/' -f1)",
-  "policy": "two_factor",
-  "subject": [$(printf '"%s",' "${groups_array[@]}" | sed 's/,$//')],
-  "resources": ["$resource_url"]
-}
-EOF
-    )
-
-    # Add to access control rules (this is a simplified example)
-    # In practice, you'd need to properly merge with existing YAML structure
-    info "Resource configuration prepared"
-    warn "Manual verification of access control file required"
-
-    log "Resource added successfully"
-    info "Backup created: $backup_file"
-}
-
-# Remove protected resource
-remove_resource() {
-    local resource_url="$RESOURCE_URL"
-
-    log "Removing protected resource: $resource_url"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would remove resource $resource_url"
-        return
-    fi
-
-    # Backup before changes
-    local backup_file=$(backup_policies)
-
-    # Remove from access control (simplified implementation)
-    warn "Resource removal requires manual editing of access control file"
-    info "Resource: $resource_url"
-
-    log "Resource removal initiated"
-    info "Backup created: $backup_file"
-}
-
-# Update device-specific policy
-update_device_policy() {
-    local device_id="$DEVICE_TARGET"
-    local new_policy="$NEW_POLICY"
-
-    log "Updating device policy for: $device_id to $new_policy"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would update device $device_id policy to $new_policy"
-        return
-    fi
-
-    # Check if device exists in inventory
-    if [[ ! -f "$DEVICE_INVENTORY" ]] || ! jq -e ".devices[] | select(.id == \"$device_id\")" "$DEVICE_INVENTORY" >/dev/null; then
-        error "Device $device_id not found in inventory"
-    fi
-
-    # Backup before changes
-    local backup_file=$(backup_policies)
-
-    # Update device policy in inventory
-    jq "(.devices[] | select(.id == \"$device_id\") | .policy) = \"$new_policy\"" \
-       "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-
-    # Update last modified timestamp
-    jq "(.devices[] | select(.id == \"$device_id\") | .last_modified) = \"$(date -Iseconds)\"" \
-       "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-
-    log "Device policy updated successfully"
-    info "Backup created: $backup_file"
-}
-
-# List all current policies
-list_policies() {
-    log "Current Policy Overview"
-    echo "======================"
-
-    # List users and their access levels
-    echo ""
-    echo "Users and Access Levels:"
-    echo "------------------------"
-    if [[ -f "$USERS_DB_FILE" ]]; then
-        yq eval '.users | to_entries | .[] | .key + ": " + (.value.groups | join(","))' "$USERS_DB_FILE"
-    else
-        warn "Users database file not found"
-    fi
-
-    # List devices and their policies
-    echo ""
-    echo "Devices and Policies:"
-    echo "--------------------"
-    if [[ -f "$DEVICE_INVENTORY" ]]; then
-        jq -r '.devices[] | "\(.id): \(.access_level) (\(.device_type))"' "$DEVICE_INVENTORY"
-    else
-        warn "Device inventory file not found"
-    fi
-
-    # List protected resources
-    echo ""
-    echo "Protected Resources:"
-    echo "-------------------"
-    if [[ -f "$ACCESS_CONTROL_FILE" ]]; then
-        yq eval '.access_control.rules[] | .domain + " -> " + (.subject | join(","))' "$ACCESS_CONTROL_FILE" 2>/dev/null || warn "No access control rules found"
-    else
-        warn "Access control file not found"
-    fi
-}
-
-# Synchronize policies across services
-sync_policies() {
-    log "Synchronizing policies across services..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would synchronize policies"
-        return
-    fi
-
-    # Restart Authelia to reload configuration
-    if systemctl is-active --quiet authelia; then
-        log "Restarting Authelia service..."
-        systemctl restart authelia
-    else
-        warn "Authelia service is not running"
-    fi
-
-    # Reload WireGuard configuration if needed
-    if systemctl is-active --quiet wg-quick@wg0; then
-        log "Reloading WireGuard configuration..."
-        wg syncconf wg0 <(wg-quick strip wg0)
-    else
-        warn "WireGuard service is not running"
-    fi
-
-    log "Policy synchronization completed"
-}
-
-# Restore policies from backup
-restore_policies() {
-    local backup_file="$BACKUP_FILE"
-
-    log "Restoring policies from backup: $backup_file"
-
-    if [[ ! -f "$backup_file" ]]; then
-        error "Backup file not found: $backup_file"
-    fi
-
-    if [[ "$FORCE" != "true" ]]; then
-        echo -n "This will overwrite current policies. Continue? (y/N): "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            info "Operation cancelled"
-            exit 0
+    net_names="$(yq -o=json -I0 '[(.access_control.networks // [])[] | .name]' "$AUTHELIA_CONFIG")"
+    rules="$(rules_json)"
+    local problems
+    problems="$(jq -r --argjson nets "$net_names" --arg known "$KNOWN_GROUPS" '
+        ($known | split(",")) as $groups |
+        if type != "array" then "access_control.rules is not a list" else
+        to_entries[] | .key as $i | .value as $r |
+        (if ($r.domain // $r.domain_regex) == null then "rule \($i): no domain" else empty end),
+        (if ($r.policy | IN("bypass", "one_factor", "two_factor", "deny")) then empty
+         else "rule \($i): invalid policy \($r.policy)" end),
+        (($r.networks // []) | if type == "array" then .[] else . end
+         | select((. as $n | $nets | index($n)) == null and (test("^[0-9.]+(/[0-9]+)?$") | not))
+         | "rule \($i): unknown network \(.)"),
+        (($r.subject // []) | if type == "array" then .[] else . end | if type == "array" then .[] else . end
+         | select(startswith("group:")) | ltrimstr("group:")
+         | select(. as $g | $groups | index($g) == null)
+         | "WARN rule \($i): group \(.) is not in KNOWN_GROUPS")
+        end' <<<"$rules")" || { error "Could not inspect rules"; return 1; }
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" == WARN* ]]; then
+            warn "${line#WARN }"
+        else
+            error "$line"
+            errors=$((errors + 1))
         fi
-    fi
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would restore from $backup_file"
-        return
-    fi
-
-    # Create backup of current state before restore
-    local current_backup=$(backup_policies)
-    log "Current state backed up to: $current_backup"
-
-    # Extract backup
-    tar -xzf "$backup_file" -C "$PROJECT_ROOT"
-
-    log "Policies restored successfully"
-    info "Previous state backed up to: $current_backup"
+    done <<<"$problems"
+    ((errors == 0))
 }
 
-# Main execution
-main() {
-    case "$COMMAND" in
-        update-user-access)
-            update_user_access
-            ;;
-        update-device-policy)
-            update_device_policy
-            ;;
-        add-resource)
-            add_resource
-            ;;
-        remove-resource)
-            remove_resource
-            ;;
-        list-policies)
-            list_policies
-            ;;
-        validate-config)
-            validate_config
-            ;;
-        backup-policies)
-            backup_policies
-            ;;
-        restore-policies)
-            restore_policies
-            ;;
-        sync-policies)
-            sync_policies
-            ;;
-        *)
-            error "Unknown command: $COMMAND"
-            ;;
+check_users_db() {
+    [[ "$AUTHELIA_BACKEND" == file ]] || return 0
+    [[ -f "$AUTHELIA_USERS_DB" ]] || { warn "No users database at $AUTHELIA_USERS_DB"; return 0; }
+    local users problems line errors=0
+    users="$(yq -o=json -I0 '.users' "$AUTHELIA_USERS_DB" 2>/dev/null)" || {
+        error "$AUTHELIA_USERS_DB is not valid YAML"
+        return 1
+    }
+    problems="$(jq -r --arg known "$KNOWN_GROUPS" '
+        ($known | split(",")) as $groups |
+        if type != "object" then "users is not a map" else
+        to_entries[] | .key as $u | .value as $v |
+        (if ($v.password | type) != "string" or ($v.password | startswith("$argon2id$") | not)
+         then "user \($u): password is not an argon2id hash" else empty end),
+        (if ($v.groups // [] | type) != "array" then "user \($u): groups is not a list"
+         else ($v.groups // [])[] | select(. as $g | $groups | index($g) == null)
+              | "WARN user \($u): group \(.) is not in KNOWN_GROUPS" end)
+        end' <<<"$users")" || { error "Could not inspect $AUTHELIA_USERS_DB"; return 1; }
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" == WARN* ]]; then warn "${line#WARN }"; else error "$line"; errors=$((errors + 1)); fi
+    done <<<"$problems"
+    ((errors == 0))
+}
+
+docker_usable() {
+    case "$AUTHELIA_VALIDATE" in
+        yq) return 1 ;;
+        docker) require_cmd docker; return 0 ;;
+        auto) command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 ;;
+        *) die "Invalid AUTHELIA_VALIDATE: $AUTHELIA_VALIDATE (auto, docker, yq)" ;;
     esac
 }
 
-# Parse arguments and run
-parse_args "$@"
-check_prerequisites
-main
+# Runs "authelia validate-config" against the live directory with the same
+# environment docker-compose gives the container (see authelia-setup.sh):
+# template filter for {{ env "DOMAIN" }} and secrets as *_FILE under /secrets.
+docker_validate() {
+    local -a args=(run --rm --network none -v "$AUTHELIA_DIR:/config:ro"
+        -e "DOMAIN=$DOMAIN" -e "AUTH_DOMAIN=$AUTH_DOMAIN"
+        -e "VPN_SUBNET=$VPN_SUBNET" -e "SERVICES_SUBNET=$SERVICES_SUBNET")
+    grep -q '{{' "$AUTHELIA_CONFIG" && args+=(-e X_AUTHELIA_CONFIG_FILTERS=template)
+    if [[ -d "$AUTHELIA_SECRETS_DIR" ]]; then
+        args+=(-v "$AUTHELIA_SECRETS_DIR:/secrets:ro")
+        local var file
+        while read -r var file; do
+            [[ -f "$AUTHELIA_SECRETS_DIR/$file" ]] && args+=(-e "${var}_FILE=/secrets/$file")
+        done <<'LIST'
+AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET jwt_secret
+AUTHELIA_SESSION_SECRET session_secret
+AUTHELIA_STORAGE_ENCRYPTION_KEY storage_encryption_key
+AUTHELIA_STORAGE_POSTGRES_PASSWORD postgres_password
+AUTHELIA_SESSION_REDIS_PASSWORD redis_password
+AUTHELIA_NOTIFIER_SMTP_PASSWORD smtp_password
+LIST
+    fi
+    docker "${args[@]}" "$AUTHELIA_IMAGE" \
+        authelia validate-config --config "/config/$(basename "$AUTHELIA_CONFIG")" >&2
+}
+
+# Set by begin_change: did docker validation pass before the change?
+BASELINE_DOCKER=""
+
+validate_all() {
+    local ok=0
+    if [[ -f "$AUTHELIA_CONFIG" ]]; then
+        check_config_structure || ok=1
+    else
+        error "Authelia configuration $AUTHELIA_CONFIG not found"
+        ok=1
+    fi
+    check_users_db || ok=1
+    ((ok == 0)) || return 1
+    if [[ -f "$AUTHELIA_CONFIG" ]] && docker_usable; then
+        if docker_validate; then
+            info "authelia validate-config passed"
+        elif [[ "$BASELINE_DOCKER" == failed ]]; then
+            warn "authelia validate-config also failed before this change; only structural checks apply"
+        else
+            error "authelia validate-config failed"
+            return 1
+        fi
+    else
+        info "Structural checks passed (Authelia validation not available, AUTHELIA_VALIDATE=$AUTHELIA_VALIDATE)"
+    fi
+}
+
+BACKUP=""
+begin_change() {
+    ztvpn_lock policy
+    ztvpn_lock users
+    BACKUP="$(make_backup)" || die "Could not create a backup; nothing changed"
+    info "Backup: $BACKUP"
+    if [[ -f "$AUTHELIA_CONFIG" ]] && docker_usable; then
+        if docker_validate 2>/dev/null; then
+            BASELINE_DOCKER=passed
+        else
+            BASELINE_DOCKER=failed
+            warn "The current configuration does not pass authelia validate-config"
+        fi
+    fi
+}
+
+finish_change() {
+    local what="$1"
+    if validate_all; then
+        audit policy-update "$what result=ok backup=$BACKUP"
+        success "$what"
+        return 0
+    fi
+    if restore_from "$BACKUP"; then
+        audit policy-update "$what result=rolled-back backup=$BACKUP"
+        die "Validation failed; restored the previous files from $BACKUP"
+    fi
+    die "Validation failed AND restoring $BACKUP failed; restore it manually"
+}
+
+maybe_restart() {
+    if ((RESTART)); then
+        [[ "$AUTHELIA_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Invalid AUTHELIA_CONTAINER"
+        require_cmd docker
+        docker restart "$AUTHELIA_CONTAINER" >/dev/null || die "Could not restart $AUTHELIA_CONTAINER"
+        success "Restarted $AUTHELIA_CONTAINER"
+    else
+        info "Restart Authelia to apply configuration changes (or pass --restart)"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Rules
+# --------------------------------------------------------------------------
+
+cmd_list_rules() {
+    require_config
+    if ((JSON)); then
+        rules_json | jq .
+        return 0
+    fi
+    rules_json | jq -r '
+        def csv: if . == null then "-" elif type == "array" then map(if type == "array" then join("&") else tostring end) | join(",") else tostring end;
+        (["INDEX", "DOMAIN", "POLICY", "SUBJECT", "NETWORKS", "RESOURCES"] | @tsv),
+        (to_entries[] | [(.key | tostring), (.value.domain // .value.domain_regex | csv), (.value.policy // "-"),
+            (.value.subject | csv), (.value.networks | csv), (.value.resources | csv)] | @tsv)'
+}
+
+validate_domain() {
+    [[ "$1" =~ ^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] && ((${#1} <= 253))
+}
+
+cmd_add_rule() {
+    require_root
+    require_config
+    ((${#ARGS[@]} == 0)) || die "Unexpected argument: ${ARGS[0]}"
+    [[ -n "$DOMAIN_ARG" ]] || die "--domain is required"
+    DOMAIN_ARG="${DOMAIN_ARG,,}"
+    validate_domain "$DOMAIN_ARG" || die "Invalid domain: $DOMAIN_ARG"
+    case "$POLICY" in
+        one_factor|two_factor|deny) ;;
+        "") die "--policy is required" ;;
+        *) die "Invalid policy: $POLICY (one_factor, two_factor, deny)" ;;
+    esac
+
+    local s n r
+    for s in "${SUBJECTS[@]}"; do
+        case "$s" in
+            group:*) is_known_group "${s#group:}" || die "Unknown group in subject: ${s#group:} (allowed: $KNOWN_GROUPS)" ;;
+            user:*)  check_username "${s#user:}" ;;
+            *) die "Invalid subject: $s (use group:<name> or user:<name>)" ;;
+        esac
+    done
+    local nets
+    nets="$(yq -o=json -I0 '[(.access_control.networks // [])[] | .name]' "$AUTHELIA_CONFIG")"
+    for n in "${NETWORKS[@]}"; do
+        if validate_cidr "$n" || validate_ipv4 "$n"; then continue; fi
+        jq -e --arg n "$n" 'index($n) != null' <<<"$nets" >/dev/null ||
+            die "Unknown network: $n (defined: $(jq -r 'join(", ")' <<<"$nets"))"
+    done
+    for r in "${RESOURCES[@]}"; do
+        [[ ${#r} -le 512 && "$r" =~ ^[[:print:]]+$ ]] || die "Invalid resource pattern"
+        jq -n --arg r "$r" '"" | test($r)' >/dev/null 2>&1 || die "Resource is not a valid regular expression: $r"
+    done
+
+    local count
+    count="$(rules_json | jq 'length')"
+    if [[ -z "$POSITION" ]]; then
+        POSITION="$count"
+    else
+        [[ "$POSITION" =~ ^[0-9]+$ ]] && ((POSITION <= count)) || die "Invalid --position (0..$count)"
+    fi
+
+    local rule
+    rule="$(jq -cn --arg d "$DOMAIN_ARG" --arg p "$POLICY" '{domain: $d, policy: $p}')"
+    # Lists are added one by one so that every value stays a --arg.
+    if ((${#SUBJECTS[@]})); then
+        rule="$(jq -c '.subject = $ARGS.positional' --args "${SUBJECTS[@]}" <<<"$rule")"
+    fi
+    if ((${#NETWORKS[@]})); then
+        rule="$(jq -c '.networks = $ARGS.positional' --args "${NETWORKS[@]}" <<<"$rule")"
+    fi
+    if ((${#RESOURCES[@]})); then
+        rule="$(jq -c '.resources = $ARGS.positional' --args "${RESOURCES[@]}" <<<"$rule")"
+    fi
+
+    begin_change
+    R="$rule" P="$POSITION" yq_edit '.access_control.rules = (.access_control.rules // []) |
+        .access_control.rules |= (.[:env(P)] + [strenv(R) | from_json | ... style=""] + .[env(P):])' \
+        "$AUTHELIA_CONFIG" || { restore_from "$BACKUP"; die "Could not write $AUTHELIA_CONFIG"; }
+    finish_change "Added rule #$POSITION: $DOMAIN_ARG -> $POLICY"
+    maybe_restart
+}
+
+cmd_remove_rule() {
+    require_root
+    require_config
+    ((${#ARGS[@]} == 0)) || die "Unexpected argument: ${ARGS[0]}"
+    [[ -n "$INDEX" && -z "$DOMAIN_ARG" || -z "$INDEX" && -n "$DOMAIN_ARG" ]] ||
+        die "Give exactly one of --index or --domain"
+    local rules count
+    rules="$(rules_json)"
+    count="$(jq 'length' <<<"$rules")"
+
+    if [[ -n "$INDEX" ]]; then
+        [[ "$INDEX" =~ ^[0-9]+$ ]] && ((INDEX < count)) || die "No rule with index $INDEX (0..$((count - 1)))"
+        begin_change
+        I="$INDEX" yq_edit 'del(.access_control.rules[env(I)])' "$AUTHELIA_CONFIG" ||
+            { restore_from "$BACKUP"; die "Could not write $AUTHELIA_CONFIG"; }
+        finish_change "Removed rule #$INDEX"
+        maybe_restart
+        return 0
+    fi
+
+    DOMAIN_ARG="${DOMAIN_ARG,,}"
+    validate_domain "$DOMAIN_ARG" || die "Invalid domain: $DOMAIN_ARG"
+    # "del <i>" for rules that only cover this domain, "trim <i>" for rules
+    # that list it among others. Highest index first so indices stay valid.
+    local plan
+    # Domains in the shipped config are templates ('app.{{ env "DOMAIN" }}');
+    # they match both literally and after expansion.
+    plan="$(jq -r --arg d "$DOMAIN_ARG" --arg dom "$DOMAIN" --arg auth "$AUTH_DOMAIN" '
+        def expand: gsub("\\{\\{ *env +\"AUTH_DOMAIN\" *\\}\\}"; $auth) | gsub("\\{\\{ *env +\"DOMAIN\" *\\}\\}"; $dom);
+        def hit: . == $d or (expand == $d);
+        def doms: if type == "array" then . else [.] end;
+        to_entries | reverse[] | .key as $i | (.value.domain // null) as $v |
+        if $v == null then empty
+        elif ($v | doms | all(hit)) then "del \($i)"
+        elif ($v | doms | any(hit)) then ($v | doms | map(select(hit)) | .[] | "trim \($i) \(.)")
+        else empty end' <<<"$rules")"
+    [[ -n "$plan" ]] || die "No rule for domain $DOMAIN_ARG"
+
+    begin_change
+    local op idx value n=0
+    while read -r op idx value; do
+        case "$op" in
+            del)  I="$idx" yq_edit 'del(.access_control.rules[env(I)])' "$AUTHELIA_CONFIG" ;;
+            trim) I="$idx" D="$value" yq_edit '.access_control.rules[env(I)].domain |= (. - [strenv(D)])' "$AUTHELIA_CONFIG" ;;
+        esac || { restore_from "$BACKUP"; die "Could not write $AUTHELIA_CONFIG"; }
+        n=$((n + 1))
+    done <<<"$plan"
+    finish_change "Removed $DOMAIN_ARG from $n rule change(s)"
+    maybe_restart
+}
+
+# --------------------------------------------------------------------------
+# Groups
+# --------------------------------------------------------------------------
+
+groups_of() {
+    authelia_user_groups "$1" | paste -sd, -
+}
+
+cmd_set_groups() {
+    require_root
+    ((${#ARGS[@]} == 2)) || die "Usage: set-groups <user> g1,g2 [--exact]"
+    local user="${ARGS[0]}" g
+    check_username "$user"
+    require_file_backend
+    local -a wanted=()
+    while IFS= read -r g; do
+        validate_group "$g" || die "Invalid group name: $g"
+        is_known_group "$g" || die "Unknown group: $g (allowed: $KNOWN_GROUPS)"
+        wanted+=("$g")
+    done < <(split_csv "${ARGS[1]}")
+    authelia_user_exists "$user" || die "Authelia user $user not found"
+
+    if ((!EXACT)); then
+        # Keep the base groups the user already has.
+        local cur d
+        while IFS= read -r cur; do
+            while IFS= read -r d; do
+                [[ "$cur" == "$d" ]] && wanted+=("$cur")
+            done < <(split_csv "$DEFAULT_USER_GROUPS")
+        done < <(authelia_user_groups "$user")
+    fi
+    ((${#wanted[@]})) || die "Refusing to leave $user without any group (use revoke-user.sh to remove access)"
+    local csv before
+    csv="$(IFS=,; printf '%s' "${wanted[*]}")"
+    before="$(groups_of "$user")"
+
+    begin_change
+    authelia_set_groups "$user" "$csv" || { restore_from "$BACKUP"; die "Could not update groups of $user"; }
+    finish_change "Groups of $user: [$before] -> [$(groups_of "$user")]"
+    groups_of "$user"
+}
+
+cmd_add_group() {
+    require_root
+    ((${#ARGS[@]} == 2)) || die "Usage: add-group <user> <group>"
+    local user="${ARGS[0]}" group="${ARGS[1]}"
+    check_username "$user"
+    validate_group "$group" || die "Invalid group name: $group"
+    is_known_group "$group" || die "Unknown group: $group (allowed: $KNOWN_GROUPS)"
+    require_file_backend
+    authelia_user_exists "$user" || die "Authelia user $user not found"
+    begin_change
+    authelia_add_group "$user" "$group" || { restore_from "$BACKUP"; die "Could not update groups of $user"; }
+    finish_change "Added $user to $group"
+    groups_of "$user"
+}
+
+cmd_remove_group() {
+    require_root
+    ((${#ARGS[@]} == 2)) || die "Usage: remove-group <user> <group>"
+    local user="${ARGS[0]}" group="${ARGS[1]}"
+    check_username "$user"
+    validate_group "$group" || die "Invalid group name: $group"
+    require_file_backend
+    authelia_user_exists "$user" || die "Authelia user $user not found"
+    local current
+    current="$(authelia_user_groups "$user")"
+    grep -qxF -- "$group" <<<"$current" || die "$user is not in group $group"
+    begin_change
+    authelia_remove_group "$user" "$group" || { restore_from "$BACKUP"; die "Could not update groups of $user"; }
+    finish_change "Removed $user from $group"
+    groups_of "$user"
+}
+
+# --------------------------------------------------------------------------
+# Maintenance
+# --------------------------------------------------------------------------
+
+cmd_validate() {
+    validate_all || die "Validation failed"
+    success "Configuration is valid"
+}
+
+cmd_backup() {
+    require_root
+    ztvpn_lock policy
+    make_backup
+}
+
+cmd_restore() {
+    require_root
+    ((${#ARGS[@]} == 1)) || die "Usage: restore <backup-name|path>"
+    local src="${ARGS[0]}" base
+    [[ "$src" == */* ]] || src="$POLICY_BACKUP_DIR/$src"
+    src="$(readlink -f "$src")" || die "Backup not found"
+    base="$(readlink -f "$POLICY_BACKUP_DIR")"
+    [[ "$src" == "$base"/* && -d "$src" ]] || die "Backup must be a directory under $POLICY_BACKUP_DIR"
+    [[ -f "$src/$(basename "$AUTHELIA_CONFIG")" || -f "$src/$(basename "$AUTHELIA_USERS_DB")" ]] ||
+        die "$src contains neither $(basename "$AUTHELIA_CONFIG") nor $(basename "$AUTHELIA_USERS_DB")"
+
+    begin_change
+    restore_from "$src" || { restore_from "$BACKUP"; die "Could not restore $src"; }
+    finish_change "Restored $src"
+    maybe_restart
+}
+
+case "$COMMAND" in
+    list-rules)   cmd_list_rules ;;
+    add-rule)     cmd_add_rule ;;
+    remove-rule)  cmd_remove_rule ;;
+    set-groups)   cmd_set_groups ;;
+    add-group)    cmd_add_group ;;
+    remove-group) cmd_remove_group ;;
+    validate)     cmd_validate ;;
+    backup)       cmd_backup ;;
+    restore)      cmd_restore ;;
+esac

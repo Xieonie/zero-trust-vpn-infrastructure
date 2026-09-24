@@ -65,6 +65,23 @@ CONF
     ! validate_username 'bob"x'
     ! validate_username "$(printf 'bob\nx')"
     ! validate_username '-rf'
+    ! validate_username 'bob--x'
+    ! validate_username 'bob-'
+}
+
+@test "add then remove restores wg0.conf byte for byte" {
+    load_lib
+    ztvpn_fake_wg_server
+    wg_add_peer alice "$(wg genkey | wg pubkey)" 10.8.0.2
+    cp "$WG_CONF" "$BATS_TEST_TMPDIR/before"
+    wg_add_peer bob "$(wg genkey | wg pubkey)" 10.8.0.3
+    wg_remove_peer bob
+    cmp "$WG_CONF" "$BATS_TEST_TMPDIR/before"
+    wg_remove_peer alice
+    wg_add_peer carol "$(wg genkey | wg pubkey)" 10.8.0.4
+    wg_remove_peer carol
+    run wg-quick strip "$WG_CONF"
+    [ "$status" -eq 0 ]
 }
 
 @test "email and IP validation" {

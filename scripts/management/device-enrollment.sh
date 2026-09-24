@@ -1,507 +1,357 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Enrols additional devices of an existing user as WireGuard peers
+# "<user>--<device>" and keeps the device inventory.
+set -Eeuo pipefail
 
-# Zero Trust VPN Infrastructure - Device Enrollment Script
-# This script handles the enrollment of new devices into the Zero Trust VPN
-# It creates certificates, WireGuard configurations, and updates access policies
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
-CONFIG_DIR="$PROJECT_ROOT/config-examples"
-CERT_DIR="$PROJECT_ROOT/certificates"
-WG_CONFIG_DIR="/etc/wireguard"
-AUTHELIA_CONFIG="$CONFIG_DIR/authelia/users_database.yml"
-
-# Default values
-DEFAULT_DEVICE_TYPE="laptop"
-DEFAULT_ACCESS_LEVEL="standard"
-DEFAULT_CERT_DAYS="365"
-
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
-}
-
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
-}
-
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-    exit 1
-}
-
-info() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
-}
-
-# Display usage information
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") <command> [options]
 
-Zero Trust VPN Device Enrollment Script
+Commands:
+  enroll --user U --device D [--type T] [--ip IP] [--cert] [--qr] [--dry-run]
+         Create WireGuard peer "U--D" for an existing Authelia user.
+         --type   laptop | desktop | phone | tablet (default: laptop)
+         --ip     fixed tunnel address inside $VPN_SUBNET (default: next free)
+         --cert   also issue a client certificate (CN = U--D)
+         --qr     write a QR code PNG of the client config (needs qrencode)
+         --dry-run  validate and show what would happen, change nothing
+  remove --user U --device D [--reason R]
+         Remove the peer, revoke its certificate, mark it revoked in the inventory.
+  list   [--user U] [--json]
+         List inventory entries.
+  show   --user U --device D
+         Print the inventory entry and peer state as JSON (no key material).
 
-OPTIONS:
-    -u, --user USER         Username for the device owner (required)
-    -d, --device DEVICE     Device name/identifier (required)
-    -t, --type TYPE         Device type (laptop, mobile, server) [default: $DEFAULT_DEVICE_TYPE]
-    -l, --level LEVEL       Access level (admin, standard, limited) [default: $DEFAULT_ACCESS_LEVEL]
-    -e, --email EMAIL       User email address (required)
-    -i, --ip IP             Assign specific IP address (optional)
-    --cert-days DAYS        Certificate validity in days [default: $DEFAULT_CERT_DAYS]
-    --dry-run               Show what would be done without making changes
-    -h, --help              Show this help message
-
-EXAMPLES:
-    $0 -u john.doe -d laptop-work -e john.doe@company.com
-    $0 -u jane.smith -d mobile-iphone -t mobile -l admin -e jane.smith@company.com
-    $0 -u server-01 -d prod-server -t server -l limited -e admin@company.com --cert-days 730
-
+Inventory: $DEVICE_INVENTORY
 EOF
 }
 
-# Parse command line arguments
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -u|--user)
-                USERNAME="$2"
-                shift 2
-                ;;
-            -d|--device)
-                DEVICE_NAME="$2"
-                shift 2
-                ;;
-            -t|--type)
-                DEVICE_TYPE="$2"
-                shift 2
-                ;;
-            -l|--level)
-                ACCESS_LEVEL="$2"
-                shift 2
-                ;;
-            -e|--email)
-                USER_EMAIL="$2"
-                shift 2
-                ;;
-            -i|--ip)
-                ASSIGNED_IP="$2"
-                shift 2
-                ;;
-            --cert-days)
-                CERT_DAYS="$2"
-                shift 2
-                ;;
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                error "Unknown option: $1"
-                ;;
-        esac
-    done
+need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
 
-    # Set defaults
-    DEVICE_TYPE="${DEVICE_TYPE:-$DEFAULT_DEVICE_TYPE}"
-    ACCESS_LEVEL="${ACCESS_LEVEL:-$DEFAULT_ACCESS_LEVEL}"
-    CERT_DAYS="${CERT_DAYS:-$DEFAULT_CERT_DAYS}"
-    DRY_RUN="${DRY_RUN:-false}"
+COMMAND="${1:-}"
+[[ -n "$COMMAND" ]] || { usage >&2; exit 1; }
+shift
+case "$COMMAND" in
+    -h|--help|help) usage; exit 0 ;;
+    enroll|remove|list|show) ;;
+    *) die "Unknown command: $COMMAND (see --help)" ;;
+esac
 
-    # Validate required parameters
-    if [[ -z "${USERNAME:-}" ]]; then
-        error "Username is required. Use -u or --user"
-    fi
+USERNAME="" DEVICE="" DEVICE_TYPE="laptop" FIXED_IP="" REASON="cessationOfOperation"
+WANT_CERT=0 WANT_QR=0 DRY_RUN=0 JSON=0
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --user)   need_value "$@"; USERNAME="$2"; shift 2 ;;
+        --device) need_value "$@"; DEVICE="$2"; shift 2 ;;
+        --type)   need_value "$@"; DEVICE_TYPE="$2"; shift 2 ;;
+        --ip)     need_value "$@"; FIXED_IP="$2"; shift 2 ;;
+        --reason) need_value "$@"; REASON="$2"; shift 2 ;;
+        --cert)   WANT_CERT=1; shift ;;
+        --qr)     WANT_QR=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --json)   JSON=1; shift ;;
+        *) die "Unknown option: $1 (see --help)" ;;
+    esac
+done
 
-    if [[ -z "${DEVICE_NAME:-}" ]]; then
-        error "Device name is required. Use -d or --device"
-    fi
-
-    if [[ -z "${USER_EMAIL:-}" ]]; then
-        error "User email is required. Use -e or --email"
-    fi
-
-    # Validate device type
-    if [[ ! "$DEVICE_TYPE" =~ ^(laptop|mobile|server|iot)$ ]]; then
-        error "Invalid device type. Must be: laptop, mobile, server, or iot"
-    fi
-
-    # Validate access level
-    if [[ ! "$ACCESS_LEVEL" =~ ^(admin|standard|limited)$ ]]; then
-        error "Invalid access level. Must be: admin, standard, or limited"
-    fi
+check_user() {
+    [[ -n "$USERNAME" ]] || die "--user is required"
+    validate_username "$USERNAME" && [[ "$USERNAME" != *--* ]] || die "Invalid username: $USERNAME"
+}
+check_device() {
+    [[ -n "$DEVICE" ]] || die "--device is required"
+    validate_device_name "$DEVICE" || die "Invalid device name: $DEVICE"
+    PEER="$USERNAME--$DEVICE"
+    validate_peer_name "$PEER" || die "Invalid peer name: $PEER"
 }
 
-# Check prerequisites
-check_prerequisites() {
-    log "Checking prerequisites..."
+# --------------------------------------------------------------------------
+# Inventory helpers (candidates for the shared lib)
+# --------------------------------------------------------------------------
 
-    # Check if running as root or with sudo
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root or with sudo"
-    fi
-
-    # Check required commands
-    local required_commands=("openssl" "wg" "qrencode" "yq")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            error "Required command not found: $cmd"
-        fi
-    done
-
-    # Check directory structure
-    if [[ ! -d "$CERT_DIR" ]]; then
-        warn "Certificate directory not found, creating: $CERT_DIR"
-        mkdir -p "$CERT_DIR"/{ca,server,clients,crl}
-    fi
-
-    # Check if CA exists
-    if [[ ! -f "$CERT_DIR/ca/ca.crt" ]]; then
-        error "CA certificate not found. Run pki-setup.sh first."
-    fi
+inventory_init() {
+    [[ -f "$DEVICE_INVENTORY" ]] && return 0
+    mkdir -p "$(dirname "$DEVICE_INVENTORY")"
+    printf '{"devices": []}\n' | atomic_write "$DEVICE_INVENTORY" 600
 }
 
-# Generate next available IP address
-get_next_ip() {
-    local base_ip="10.0.2"
-    local start_range=10
-    local end_range=254
-
-    if [[ -n "${ASSIGNED_IP:-}" ]]; then
-        echo "$ASSIGNED_IP"
-        return
-    fi
-
-    # Check existing WireGuard configurations
-    for i in $(seq $start_range $end_range); do
-        local test_ip="$base_ip.$i"
-        if ! grep -r "$test_ip" "$WG_CONFIG_DIR" &>/dev/null && \
-           ! grep -r "$test_ip" "$CERT_DIR/clients" &>/dev/null; then
-            echo "$test_ip"
-            return
-        fi
-    done
-
-    error "No available IP addresses in range $base_ip.$start_range-$end_range"
+# inventory_edit <constant jq program> [jq --arg ...]
+inventory_edit() {
+    local prog="$1" out
+    shift
+    out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
+    printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
 }
 
-# Generate client certificate
-generate_certificate() {
-    local client_ip="$1"
-    local cert_dir="$CERT_DIR/clients/$USERNAME-$DEVICE_NAME"
-
-    log "Generating certificate for $USERNAME-$DEVICE_NAME..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would generate certificate in $cert_dir"
-        return
-    fi
-
-    mkdir -p "$cert_dir"
-
-    # Generate private key
-    openssl genrsa -out "$cert_dir/client.key" 2048
-
-    # Generate certificate signing request
-    cat > "$cert_dir/client.conf" << EOF
-[req]
-distinguished_name = req_distinguished_name
-req_extensions = v3_req
-prompt = no
-
-[req_distinguished_name]
-C = US
-ST = State
-L = City
-O = Zero Trust VPN
-OU = Client Certificates
-CN = $USERNAME-$DEVICE_NAME
-emailAddress = $USER_EMAIL
-
-[v3_req]
-basicConstraints = CA:FALSE
-keyUsage = nonRepudiation, digitalSignature, keyEncipherment
-subjectAltName = @alt_names
-extendedKeyUsage = clientAuth
-
-[alt_names]
-DNS.1 = $USERNAME-$DEVICE_NAME
-IP.1 = $client_ip
-EOF
-
-    # Generate CSR
-    openssl req -new -key "$cert_dir/client.key" -out "$cert_dir/client.csr" -config "$cert_dir/client.conf"
-
-    # Sign certificate with CA
-    openssl x509 -req -in "$cert_dir/client.csr" \
-        -CA "$CERT_DIR/ca/ca.crt" \
-        -CAkey "$CERT_DIR/ca/ca.key" \
-        -CAcreateserial \
-        -out "$cert_dir/client.crt" \
-        -days "$CERT_DAYS" \
-        -extensions v3_req \
-        -extfile "$cert_dir/client.conf"
-
-    # Set appropriate permissions
-    chmod 600 "$cert_dir/client.key"
-    chmod 644 "$cert_dir/client.crt"
-
-    log "Certificate generated successfully"
-}
-
-# Generate WireGuard configuration
-generate_wireguard_config() {
-    local client_ip="$1"
-    local wg_dir="$CERT_DIR/clients/$USERNAME-$DEVICE_NAME"
-
-    log "Generating WireGuard configuration..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would generate WireGuard config for IP $client_ip"
-        return
-    fi
-
-    # Generate WireGuard keys
-    local private_key=$(wg genkey)
-    local public_key=$(echo "$private_key" | wg pubkey)
-    local preshared_key=$(wg genpsk)
-
-    # Save keys
-    echo "$private_key" > "$wg_dir/private.key"
-    echo "$public_key" > "$wg_dir/public.key"
-    echo "$preshared_key" > "$wg_dir/preshared.key"
-
-    # Set permissions
-    chmod 600 "$wg_dir"/*.key
-
-    # Generate client configuration
-    cat > "$wg_dir/wg0-client.conf" << EOF
-[Interface]
-# Client: $USERNAME-$DEVICE_NAME
-# Device Type: $DEVICE_TYPE
-# Access Level: $ACCESS_LEVEL
-# Generated: $(date)
-PrivateKey = $private_key
-Address = $client_ip/24
-DNS = 10.0.1.1
-
-# Security settings
-PostUp = echo "Connected to Zero Trust VPN" | logger
-PreDown = echo "Disconnecting from Zero Trust VPN" | logger
-
-[Peer]
-# Zero Trust VPN Server
-PublicKey = $(cat "$CERT_DIR/server/public.key" 2>/dev/null || echo "SERVER_PUBLIC_KEY_PLACEHOLDER")
-PresharedKey = $preshared_key
-Endpoint = vpn.example.com:51820
-AllowedIPs = 10.0.1.0/24, 10.0.2.0/24
-PersistentKeepalive = 25
-EOF
-
-    # Generate QR code for mobile devices
-    if [[ "$DEVICE_TYPE" == "mobile" ]]; then
-        qrencode -t ansiutf8 < "$wg_dir/wg0-client.conf" > "$wg_dir/qr-code.txt"
-        qrencode -t png -o "$wg_dir/qr-code.png" < "$wg_dir/wg0-client.conf"
-        log "QR code generated for mobile device"
-    fi
-
-    # Update server configuration
-    update_server_config "$public_key" "$preshared_key" "$client_ip"
-
-    log "WireGuard configuration generated successfully"
-}
-
-# Update server WireGuard configuration
-update_server_config() {
-    local public_key="$1"
-    local preshared_key="$2"
-    local client_ip="$3"
-
-    log "Updating server WireGuard configuration..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would add peer to server config"
-        return
-    fi
-
-    # Add peer to server configuration
-    cat >> "$WG_CONFIG_DIR/wg0.conf" << EOF
-
-# Client: $USERNAME-$DEVICE_NAME ($DEVICE_TYPE)
-# Access Level: $ACCESS_LEVEL
-# Added: $(date)
-[Peer]
-PublicKey = $public_key
-PresharedKey = $preshared_key
-AllowedIPs = $client_ip/32
-EOF
-
-    # Restart WireGuard if running
-    if systemctl is-active --quiet wg-quick@wg0; then
-        systemctl restart wg-quick@wg0
-        log "WireGuard service restarted"
-    fi
-}
-
-# Update Authelia user database
-update_authelia_config() {
-    log "Updating Authelia user database..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would update Authelia config for user $USERNAME"
-        return
-    fi
-
-    # Check if user already exists
-    if yq eval ".users | has(\"$USERNAME\")" "$AUTHELIA_CONFIG" | grep -q "true"; then
-        warn "User $USERNAME already exists in Authelia database"
-        return
-    fi
-
-    # Generate password hash (user will need to change this)
-    local temp_password="ChangeMe123!"
-    local password_hash=$(echo -n "$temp_password" | argon2 "$(openssl rand -base64 32)" -e -id -k 65536 -t 3 -p 4)
-
-    # Add user to Authelia database
-    yq eval ".users.\"$USERNAME\" = {
-        \"displayname\": \"$USERNAME\",
-        \"password\": \"$password_hash\",
-        \"email\": \"$USER_EMAIL\",
-        \"groups\": [\"$ACCESS_LEVEL\"]
-    }" -i "$AUTHELIA_CONFIG"
-
-    log "User added to Authelia database with temporary password: $temp_password"
-    warn "User must change password on first login!"
-}
-
-# Create device inventory entry
-create_device_inventory() {
-    local client_ip="$1"
-    local inventory_file="$PROJECT_ROOT/device-inventory.json"
-
-    log "Creating device inventory entry..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would create inventory entry"
-        return
-    fi
-
-    # Create inventory file if it doesn't exist
-    if [[ ! -f "$inventory_file" ]]; then
-        echo '{"devices": []}' > "$inventory_file"
-    fi
-
-    # Add device entry
-    local device_entry=$(cat << EOF
-{
-    "id": "$USERNAME-$DEVICE_NAME",
-    "username": "$USERNAME",
-    "device_name": "$DEVICE_NAME",
-    "device_type": "$DEVICE_TYPE",
-    "access_level": "$ACCESS_LEVEL",
-    "email": "$USER_EMAIL",
-    "ip_address": "$client_ip",
-    "enrolled_date": "$(date -Iseconds)",
-    "certificate_expiry": "$(date -d "+$CERT_DAYS days" -Iseconds)",
-    "status": "active"
-}
-EOF
-    )
-
-    # Add to inventory
-    jq ".devices += [$device_entry]" "$inventory_file" > "$inventory_file.tmp" && mv "$inventory_file.tmp" "$inventory_file"
-
-    log "Device inventory updated"
-}
-
-# Generate enrollment summary
-generate_summary() {
-    local client_ip="$1"
-    local summary_file="$CERT_DIR/clients/$USERNAME-$DEVICE_NAME/enrollment-summary.txt"
-
-    cat > "$summary_file" << EOF
-Zero Trust VPN Device Enrollment Summary
-========================================
-
-Device Information:
-- User: $USERNAME
-- Device: $DEVICE_NAME
-- Type: $DEVICE_TYPE
-- Access Level: $ACCESS_LEVEL
-- Email: $USER_EMAIL
-- IP Address: $client_ip
-- Enrollment Date: $(date)
-
-Certificate Information:
-- Validity: $CERT_DAYS days
-- Expires: $(date -d "+$CERT_DAYS days")
-
-Files Generated:
-- Certificate: client.crt
-- Private Key: client.key
-- WireGuard Config: wg0-client.conf
-$(if [[ "$DEVICE_TYPE" == "mobile" ]]; then echo "- QR Code: qr-code.png"; fi)
-
-Next Steps:
-1. Provide the WireGuard configuration to the user
-2. User should install WireGuard client
-3. User must change Authelia password on first login
-4. Test connectivity and access to authorized resources
-
-Security Notes:
-- Private keys are stored securely with restricted permissions
-- Certificate will expire on $(date -d "+$CERT_DAYS days")
-- Access is limited based on assigned access level: $ACCESS_LEVEL
-- All connections are logged and monitored
-
-EOF
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        log "Enrollment summary saved to: $summary_file"
-    fi
-}
-
-# Main enrollment process
-main() {
-    log "Starting device enrollment for $USERNAME-$DEVICE_NAME..."
-
-    check_prerequisites
-
-    local client_ip=$(get_next_ip)
-    info "Assigned IP address: $client_ip"
-
-    generate_certificate "$client_ip"
-    generate_wireguard_config "$client_ip"
-    update_authelia_config
-    create_device_inventory "$client_ip"
-    generate_summary "$client_ip"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN completed - no changes were made"
+inventory_read() {
+    if [[ -f "$DEVICE_INVENTORY" ]]; then
+        jq -e '.devices | type == "array"' "$DEVICE_INVENTORY" >/dev/null ||
+            die "$DEVICE_INVENTORY is not a valid inventory"
+        cat "$DEVICE_INVENTORY"
     else
-        log "Device enrollment completed successfully!"
-        log "Configuration files are located in: $CERT_DIR/clients/$USERNAME-$DEVICE_NAME"
-        
-        if [[ "$DEVICE_TYPE" == "mobile" ]]; then
-            log "QR code for mobile setup:"
-            cat "$CERT_DIR/clients/$USERNAME-$DEVICE_NAME/qr-code.txt"
-        fi
+        printf '{"devices": []}\n'
     fi
 }
 
-# Parse arguments and run main function
-parse_args "$@"
-main
+audit() {
+    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
+        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
+            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
+}
+
+# --------------------------------------------------------------------------
+# enroll
+# --------------------------------------------------------------------------
+
+COMMITTED=0 PEER_ATTEMPTED=0 CERT_ATTEMPTED=0 QR_FILE=""
+
+enroll_rollback() {
+    local rc=$?
+    ((COMMITTED)) && return 0
+    set +e
+    ((rc == 0)) && rc=1
+    ((PEER_ATTEMPTED || CERT_ATTEMPTED)) && warn "Rolling back enrolment of $PEER"
+    [[ -n "$QR_FILE" ]] && rm -f "$QR_FILE"
+    if ((CERT_ATTEMPTED)); then
+        pki_revoke "$PEER" cessationOfOperation
+        case $? in
+            0|2) rm -f "$PKI_CLIENTS_DIR/$PEER.key" "$PKI_CLIENTS_DIR/$PEER.crt" ;;
+            *) error "Rollback: could not revoke certificate $PEER; revoke it manually" ;;
+        esac
+    fi
+    if ((PEER_ATTEMPTED)) && { wg_peer_exists "$PEER" || [[ -e "$WG_CLIENTS_DIR/$PEER" ]]; }; then
+        wg_deprovision_peer "$PEER" || error "Rollback: could not remove peer $PEER"
+        wg_apply || error "Rollback: could not apply $WG_CONF"
+    fi
+    exit "$rc"
+}
+
+cmd_enroll() {
+    check_user
+    check_device
+    case "$DEVICE_TYPE" in
+        laptop|desktop|phone|tablet) ;;
+        *) die "Invalid device type: $DEVICE_TYPE (laptop, desktop, phone, tablet)" ;;
+    esac
+    if [[ -n "$FIXED_IP" ]]; then
+        validate_ipv4 "$FIXED_IP" || die "Invalid IP address: $FIXED_IP"
+        ip_in_cidr "$FIXED_IP" "$VPN_SUBNET" || die "$FIXED_IP is not inside VPN_SUBNET $VPN_SUBNET"
+        local bits="${VPN_SUBNET#*/}" n base
+        n="$(ip_to_int "$FIXED_IP")"
+        base=$(($(ip_to_int "${VPN_SUBNET%/*}") & ((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF)))
+        if ((n == base || n == base + (1 << (32 - bits)) - 1)); then
+            die "$FIXED_IP is the network or broadcast address of $VPN_SUBNET"
+        fi
+    fi
+
+    require_root
+    require_cmd wg jq yq openssl flock
+    require_yq || exit 1
+    ((WANT_QR)) && require_cmd qrencode
+    [[ -f "$WG_CONF" ]] || die "$WG_CONF not found; run wireguard-setup.sh first"
+    [[ "$(cat "$WG_SERVER_PUBKEY" 2>/dev/null)" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] ||
+        die "Server public key $WG_SERVER_PUBKEY is missing or invalid"
+    if ((WANT_CERT)); then
+        pki_ca_exists || die "No CA at $PKI_CA_DIR; run pki-setup.sh first"
+        ((${#PEER} <= 64)) || die "Certificate name $PEER is longer than 64 characters"
+    fi
+
+    # A dry run takes no locks: taking one creates a lock file.
+    if ((!DRY_RUN)); then
+        ztvpn_lock users
+        ztvpn_lock wg
+        ((WANT_CERT)) && ztvpn_lock pki
+        ztvpn_lock inventory
+    fi
+
+    case "$AUTHELIA_BACKEND" in
+        file)
+            authelia_user_exists "$USERNAME" ||
+                die "No Authelia user $USERNAME; create it with add-user.sh first"
+            [[ "$(authelia_user_field "$USERNAME" disabled)" != true ]] ||
+                die "Authelia user $USERNAME is disabled"
+            ;;
+        ldap) warn "AUTHELIA_BACKEND=ldap: cannot verify that $USERNAME exists in the directory" ;;
+        *) die "Unsupported AUTHELIA_BACKEND: $AUTHELIA_BACKEND" ;;
+    esac
+    wg_peer_exists "$PEER" && die "Peer $PEER already exists"
+    [[ -e "$WG_CLIENTS_DIR/$PEER" ]] && die "$WG_CLIENTS_DIR/$PEER already exists"
+    if [[ -n "$(inventory_read | jq -r --arg id "$PEER" '.devices[] | select(.id == $id and .status == "active") | .id')" ]]; then
+        die "Device $PEER is already active in the inventory"
+    fi
+    if ((WANT_CERT)) && [[ -n "$(pki_valid_serials "$PEER")" ]]; then
+        die "A valid certificate for $PEER already exists; revoke it first"
+    fi
+
+    local ip="$FIXED_IP"
+    if [[ -n "$ip" ]]; then
+        if wg_ip_in_use "$ip"; then
+            local owner
+            owner="$(wg_peer_by_ip "$ip" || true)"
+            die "$ip is already in use${owner:+ by peer $owner}"
+        fi
+    else
+        ip="$(wg_next_free_ip)" || die "No free address in $VPN_SUBNET"
+    fi
+
+    if ((DRY_RUN)); then
+        info "DRY RUN: would create peer $PEER ($DEVICE_TYPE) with $ip in $WG_CONF"
+        ((WANT_CERT)) && info "DRY RUN: would issue client certificate CN=$PEER"
+        ((WANT_QR)) && info "DRY RUN: would write QR code $WG_CLIENTS_DIR/$PEER/$PEER.png"
+        info "DRY RUN: would add $PEER to $DEVICE_INVENTORY"
+        printf 'peer=%s\nip=%s\ndry_run=1\n' "$PEER" "$ip"
+        return 0
+    fi
+
+    trap enroll_rollback EXIT
+    PEER_ATTEMPTED=1
+    ip="$(wg_provision_peer "$PEER" "$ip")"
+    validate_ipv4 "$ip" || die "Peer provisioning returned an invalid address"
+    wg_apply
+    success "WireGuard peer $PEER added with $ip"
+
+    local cert=""
+    if ((WANT_CERT)); then
+        CERT_ATTEMPTED=1
+        cert="$(pki_issue client "$PEER")"
+        success "Client certificate issued: $cert"
+    fi
+
+    local conf="$WG_CLIENTS_DIR/$PEER/$PEER.conf"
+    if ((WANT_QR)); then
+        QR_FILE="$WG_CLIENTS_DIR/$PEER/$PEER.png"
+        (umask 077; qrencode -t PNG -r "$conf" -o "$QR_FILE")
+        chmod 600 "$QR_FILE"
+    fi
+
+    local expiry=""
+    [[ -n "$cert" ]] && expiry="$(openssl x509 -in "$cert" -noout -enddate | sed 's/^notAfter=//')"
+
+    inventory_init
+    # Replace an old revoked entry with the same id instead of duplicating it.
+    inventory_edit '.devices |= (map(select(.id != $id)) + [{
+            id: $id, username: $user, device_name: $dev, device_type: $type, peer: $id,
+            ip_address: $ip, public_key: $pub,
+            certificate: (if $cert == "" then null else $cert end),
+            certificate_expiry: (if $exp == "" then null else $exp end),
+            enrolled_date: $ts, status: "active"}])' \
+        --arg id "$PEER" --arg user "$USERNAME" --arg dev "$DEVICE" --arg type "$DEVICE_TYPE" \
+        --arg ip "$ip" --arg pub "$(<"$WG_CLIENTS_DIR/$PEER/public.key")" \
+        --arg cert "$cert" --arg exp "$expiry" --arg ts "$(date -Iseconds)"
+
+    audit enroll-device "user=$USERNAME peer=$PEER ip=$ip type=$DEVICE_TYPE cert=$WANT_CERT"
+    COMMITTED=1
+    trap - EXIT
+    success "Device $PEER enrolled"
+    printf 'peer=%s\nip=%s\nclient_config=%s\n' "$PEER" "$ip" "$conf"
+    [[ -n "$cert" ]] && printf 'cert=%s\n' "$cert"
+    [[ -n "$QR_FILE" ]] && printf 'qr=%s\n' "$QR_FILE"
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# remove
+# --------------------------------------------------------------------------
+
+cmd_remove() {
+    check_user
+    check_device
+    case "$REASON" in
+        unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold) ;;
+        *) die "Invalid CRL reason: $REASON" ;;
+    esac
+    require_root
+    require_cmd wg jq openssl flock
+    ztvpn_lock wg
+    ztvpn_lock pki
+    ztvpn_lock inventory
+
+    local -a failures=()
+    local found=0 archive rc f
+    archive="$ZTVPN_BACKUP_DIR/revoked/$PEER-$(date +%Y%m%dT%H%M%S)"
+
+    if wg_peer_exists "$PEER" || [[ -e "$WG_CLIENTS_DIR/$PEER" ]]; then
+        found=1
+        (umask 077; mkdir -p "$archive")
+        chmod 700 "$ZTVPN_BACKUP_DIR/revoked"
+        if wg_deprovision_peer "$PEER" "$archive/wireguard"; then
+            success "WireGuard peer $PEER removed"
+        else
+            failures+=("remove WireGuard peer $PEER")
+        fi
+        wg_apply || failures+=("apply $WG_CONF")
+    fi
+
+    if [[ -f "$PKI_CA_DIR/index.txt" ]]; then
+        rc=0
+        pki_revoke "$PEER" "$REASON" || rc=$?
+        case "$rc" in
+            0) found=1; success "Certificates for $PEER revoked" ;;
+            2) ;;
+            *) failures+=("revoke certificate $PEER") ;;
+        esac
+        for f in "$PKI_CLIENTS_DIR/$PEER.key" "$PKI_CLIENTS_DIR/$PEER.crt"; do
+            [[ -f "$f" ]] || continue
+            found=1
+            (umask 077; mkdir -p "$archive/certs" && mv -f "$f" "$archive/certs/") ||
+                failures+=("archive $f")
+        done
+    fi
+
+    if [[ -f "$DEVICE_INVENTORY" ]] &&
+        jq -e --arg id "$PEER" 'any(.devices[]; .id == $id and .status != "revoked")' "$DEVICE_INVENTORY" >/dev/null; then
+        found=1
+        inventory_edit '.devices |= map(if .id == $id then .status = "revoked" | .revoked_date = $ts | .revoke_reason = $r else . end)' \
+            --arg id "$PEER" --arg ts "$(date -Iseconds)" --arg r "$REASON" ||
+            failures+=("update $DEVICE_INVENTORY")
+    fi
+
+    ((found)) || die "Nothing found for device $PEER"
+    if ((${#failures[@]})); then
+        audit remove-device "user=$USERNAME peer=$PEER result=partial"
+        error "Removal of $PEER INCOMPLETE. Failed steps:"
+        for f in "${failures[@]}"; do error "  - $f"; done
+        exit 1
+    fi
+    audit remove-device "user=$USERNAME peer=$PEER reason=$REASON result=ok"
+    success "Device $PEER removed"
+}
+
+# --------------------------------------------------------------------------
+# list / show
+# --------------------------------------------------------------------------
+
+cmd_list() {
+    [[ -z "$USERNAME" ]] || check_user
+    require_cmd jq
+    local filter='.devices | map(select($u == "" or .username == $u))'
+    if ((JSON)); then
+        inventory_read | jq --arg u "$USERNAME" "$filter"
+    else
+        inventory_read | jq -r --arg u "$USERNAME" "$filter"' | (["ID","USER","TYPE","IP","STATUS","ENROLLED"] | @tsv),
+            (.[] | [.id, .username, (.device_type // "-"), (.ip_address // "-"), .status, (.enrolled_date // "-")] | @tsv)'
+    fi
+}
+
+cmd_show() {
+    check_user
+    check_device
+    require_cmd jq
+    local entry live_ip=""
+    entry="$(inventory_read | jq --arg id "$PEER" '.devices | map(select(.id == $id)) | last')"
+    live_ip="$(wg_peer_ip "$PEER" || true)"
+    [[ "$entry" != null || -n "$live_ip" ]] || die "Unknown device $PEER"
+    jq -n --argjson e "$entry" --arg ip "$live_ip" --arg peer "$PEER" \
+        '($e // {id: $peer, status: "not-in-inventory"}) + {wireguard_peer_present: ($ip != ""), wireguard_ip: (if $ip == "" then null else $ip end)}'
+}
+
+case "$COMMAND" in
+    enroll) cmd_enroll ;;
+    remove) cmd_remove ;;
+    list)   cmd_list ;;
+    show)   cmd_show ;;
+esac

@@ -1,545 +1,288 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Creates a VPN user: Authelia account, WireGuard peer and optionally a
+# client certificate and a QR code of the client config.
+#
+# All-or-nothing: if any step fails, everything created so far is removed
+# again (peer, certificate, account, onboarding file).
+set -Eeuo pipefail
 
-# Zero Trust VPN User Management Script
-# Adds new users to the VPN with proper authentication and device enrollment
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <username> <email> [options]
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+Creates the Authelia account (file backend) with a random one-time password
+and provisions a WireGuard peer for the user.
 
-# Source environment variables
-if [[ -f "$PROJECT_ROOT/.env" ]]; then
-    source "$PROJECT_ROOT/.env"
-else
-    echo "Error: .env file not found. Run initial-setup.sh first."
-    exit 1
-fi
+Options:
+  --name "Display Name"  Display name (default: the username)
+  --groups g1,g2         Extra groups on top of DEFAULT_USER_GROUPS ($DEFAULT_USER_GROUPS)
+                         Allowed: $KNOWN_GROUPS
+  --admin                Also add the user to "admins"
+  --device <name>        Name the first device; peer becomes "<user>--<name>"
+  --cert                 Issue a client certificate (CN = peer name)
+  --qr                   Write a QR code PNG of the client config (needs qrencode)
+  --no-vpn               Only create the account, no WireGuard peer
+  -h, --help             Show this help
 
-# Default values
-CONFIG_PATH="${CONFIG_PATH:-/opt/zero-trust-vpn}"
-CERTS_PATH="${CERTS_PATH:-$CONFIG_PATH/certificates}"
-VPN_SUBNET="${VPN_SUBNET:-10.10.0.0/24}"
-VPN_SERVER_IP="${VPN_SERVER_IP:-10.10.0.1}"
-VPN_PORT="${VPN_PORT:-51820}"
-DNS_SERVERS="${DNS_SERVERS:-1.1.1.1,8.8.8.8}"
-DOMAIN="${DOMAIN:-vpn.example.com}"
+The one-time password is written to a 0600 file under
+$ZTVPN_SECRETS_DIR/onboarding/ and only its path is printed. Nothing is
+emailed; hand the file and the client config to the user over a secure channel.
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Logging functions
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-# Show usage
-show_usage() {
-    echo "Usage: $0 <username> <email> [options]"
-    echo ""
-    echo "Arguments:"
-    echo "  username    Username for the new VPN user"
-    echo "  email       Email address for the user"
-    echo ""
-    echo "Options:"
-    echo "  --admin     Grant admin privileges"
-    echo "  --group     Specify user group (default: users)"
-    echo "  --help, -h  Show this help message"
-    echo ""
-    echo "Examples:"
-    echo "  $0 john john@example.com"
-    echo "  $0 admin admin@example.com --admin"
-    echo "  $0 dev dev@example.com --group developers"
-}
-
-# Validate input
-validate_input() {
-    local username="$1"
-    local email="$2"
-    
-    # Validate username
-    if [[ ! "$username" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        error "Invalid username. Use only alphanumeric characters, hyphens, and underscores."
-        exit 1
-    fi
-    
-    if [[ ${#username} -lt 3 || ${#username} -gt 32 ]]; then
-        error "Username must be between 3 and 32 characters."
-        exit 1
-    fi
-    
-    # Validate email
-    if [[ ! "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        error "Invalid email address format."
-        exit 1
-    fi
-    
-    # Check if user already exists
-    if [[ -f "$CONFIG_PATH/wireguard/clients/${username}.conf" ]]; then
-        error "User '$username' already exists."
-        exit 1
-    fi
-}
-
-# Get next available IP address
-get_next_ip() {
-    local base_ip="${VPN_SUBNET%/*}"
-    local base_octets=(${base_ip//./ })
-    local network_base="${base_octets[0]}.${base_octets[1]}.${base_octets[2]}"
-    
-    # Start from .2 (server is .1)
-    for i in {2..254}; do
-        local test_ip="${network_base}.${i}"
-        
-        # Check if IP is already in use
-        if ! grep -r "Address = ${test_ip}" "$CONFIG_PATH/wireguard/clients/" 2>/dev/null; then
-            echo "$test_ip"
-            return 0
-        fi
-    done
-    
-    error "No available IP addresses in subnet $VPN_SUBNET"
-    exit 1
-}
-
-# Generate WireGuard key pair
-generate_wireguard_keys() {
-    local username="$1"
-    local client_dir="$CONFIG_PATH/wireguard/clients"
-    
-    mkdir -p "$client_dir"
-    
-    # Generate private key
-    local private_key=$(wg genkey)
-    echo "$private_key" > "$client_dir/${username}_private.key"
-    
-    # Generate public key
-    local public_key=$(echo "$private_key" | wg pubkey)
-    echo "$public_key" > "$client_dir/${username}_public.key"
-    
-    # Set permissions
-    chmod 600 "$client_dir/${username}_private.key"
-    chmod 644 "$client_dir/${username}_public.key"
-    
-    echo "$private_key:$public_key"
-}
-
-# Generate client certificate
-generate_client_certificate() {
-    local username="$1"
-    local email="$2"
-    
-    log "Generating client certificate for $username..."
-    
-    # Create certificate request
-    openssl req -new \
-        -key "$CERTS_PATH/clients/${username}_private.key" \
-        -out "$CERTS_PATH/clients/${username}.csr" \
-        -subj "/C=US/ST=State/L=City/O=Organization/OU=VPN/CN=${username}/emailAddress=${email}"
-    
-    # Sign certificate
-    openssl x509 -req \
-        -in "$CERTS_PATH/clients/${username}.csr" \
-        -CA "$CERTS_PATH/ca/ca.crt" \
-        -CAkey "$CERTS_PATH/ca/ca.key" \
-        -CAcreateserial \
-        -out "$CERTS_PATH/clients/${username}.crt" \
-        -days 365 \
-        -extensions v3_req \
-        -extfile <(cat << EOF
-[v3_req]
-basicConstraints = CA:FALSE
-keyUsage = nonRepudiation, digitalSignature, keyEncipherment
-subjectAltName = @alt_names
-
-[alt_names]
-email.1 = ${email}
+Output (stdout) is key=value lines: user, peer, ip, client_config, cert, qr, onboarding.
 EOF
-)
-    
-    # Set permissions
-    chmod 644 "$CERTS_PATH/clients/${username}.crt"
-    
-    # Clean up CSR
-    rm "$CERTS_PATH/clients/${username}.csr"
-    
-    log "✓ Client certificate generated"
 }
 
-# Create WireGuard client configuration
-create_client_config() {
-    local username="$1"
-    local email="$2"
-    local user_group="$3"
-    local is_admin="$4"
-    
-    log "Creating WireGuard configuration for $username..."
-    
-    # Generate keys
-    local keys=$(generate_wireguard_keys "$username")
-    local private_key="${keys%:*}"
-    local public_key="${keys#*:}"
-    
-    # Get IP address
-    local client_ip=$(get_next_ip)
-    
-    # Get server public key
-    local server_public_key=$(cat /etc/wireguard/server_public.key)
-    
-    # Create client configuration
-    cat > "$CONFIG_PATH/wireguard/clients/${username}.conf" << EOF
-[Interface]
-PrivateKey = $private_key
-Address = $client_ip/32
-DNS = ${DNS_SERVERS//,/ }
+USERNAME="" EMAIL="" DISPLAY_NAME="" EXTRA_GROUPS="" DEVICE=""
+ADMIN=0 WANT_CERT=0 WANT_QR=0 WANT_VPN=1
 
-# Client information
-# Username: $username
-# Email: $email
-# Group: $user_group
-# Admin: $is_admin
-# Created: $(date)
+need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
 
-[Peer]
-PublicKey = $server_public_key
-Endpoint = $DOMAIN:$VPN_PORT
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
-    
-    # Set permissions
-    chmod 600 "$CONFIG_PATH/wireguard/clients/${username}.conf"
-    
-    # Add peer to server configuration
-    add_peer_to_server "$username" "$public_key" "$client_ip"
-    
-    log "✓ Client configuration created"
-    log "  IP Address: $client_ip"
-    log "  Public Key: $public_key"
-}
-
-# Add peer to server configuration
-add_peer_to_server() {
-    local username="$1"
-    local public_key="$2"
-    local client_ip="$3"
-    
-    log "Adding peer to server configuration..."
-    
-    # Add peer to WireGuard server config
-    cat >> /etc/wireguard/wg0.conf << EOF
-
-# Client: $username
-[Peer]
-PublicKey = $public_key
-AllowedIPs = $client_ip/32
-EOF
-    
-    # Reload WireGuard configuration if service is running
-    if systemctl is-active --quiet wg-quick@wg0; then
-        wg syncconf wg0 <(wg-quick strip wg0)
-        log "✓ WireGuard configuration reloaded"
-    fi
-}
-
-# Add user to Authelia database
-add_user_to_authelia() {
-    local username="$1"
-    local email="$2"
-    local user_group="$3"
-    local is_admin="$4"
-    
-    log "Adding user to Authelia database..."
-    
-    # Generate password hash (user will need to change this)
-    local temp_password=$(openssl rand -hex 8)
-    local password_hash=$(docker run --rm authelia/authelia:latest authelia hash-password "$temp_password" | grep 'Password hash:' | cut -d' ' -f3)
-    
-    # Create users database if it doesn't exist
-    local users_db="$CONFIG_PATH/authelia/users_database.yml"
-    if [[ ! -f "$users_db" ]]; then
-        cat > "$users_db" << EOF
-users:
-EOF
-    fi
-    
-    # Determine groups
-    local groups="users"
-    if [[ "$is_admin" == "true" ]]; then
-        groups="users,admins"
-    elif [[ "$user_group" != "users" ]]; then
-        groups="users,$user_group"
-    fi
-    
-    # Add user to database
-    cat >> "$users_db" << EOF
-  $username:
-    displayname: "$username"
-    password: "$password_hash"
-    email: "$email"
-    groups:
-      - ${groups//,/
-      - }
-EOF
-    
-    log "✓ User added to Authelia database"
-    log "  Temporary password: $temp_password"
-    warning "User must change password on first login"
-}
-
-# Generate QR code for mobile setup
-generate_qr_code() {
-    local username="$1"
-    
-    log "Generating QR code for mobile setup..."
-    
-    # Check if qrencode is installed
-    if ! command -v qrencode &> /dev/null; then
-        warning "qrencode not installed. Installing..."
-        apt update && apt install -y qrencode
-    fi
-    
-    # Generate QR code
-    qrencode -t ansiutf8 < "$CONFIG_PATH/wireguard/clients/${username}.conf"
-    
-    # Save QR code to file
-    qrencode -t png -o "$CONFIG_PATH/wireguard/clients/${username}_qr.png" < "$CONFIG_PATH/wireguard/clients/${username}.conf"
-    
-    log "✓ QR code generated"
-    log "  QR code image: $CONFIG_PATH/wireguard/clients/${username}_qr.png"
-}
-
-# Send welcome email
-send_welcome_email() {
-    local username="$1"
-    local email="$2"
-    local temp_password="$3"
-    
-    if [[ -z "${SMTP_HOST:-}" ]]; then
-        warning "SMTP not configured. Skipping email notification."
-        return 0
-    fi
-    
-    log "Sending welcome email..."
-    
-    # Create email content
-    local email_content="Subject: Welcome to Zero Trust VPN
-
-Hello $username,
-
-Your VPN account has been created successfully.
-
-Login Details:
-- Username: $username
-- Temporary Password: $temp_password
-- Authentication URL: https://${AUTH_DOMAIN:-auth.$DOMAIN}
-
-Please log in and change your password immediately.
-
-Your WireGuard configuration file is attached.
-
-Best regards,
-VPN Administrator"
-    
-    # Send email (simplified - in production, use proper SMTP client)
-    echo "$email_content" | mail -s "VPN Account Created" -a "$CONFIG_PATH/wireguard/clients/${username}.conf" "$email" 2>/dev/null || {
-        warning "Failed to send email. Please send configuration manually."
-    }
-    
-    log "✓ Welcome email sent"
-}
-
-# Create user documentation
-create_user_documentation() {
-    local username="$1"
-    local email="$2"
-    local client_ip="$3"
-    
-    log "Creating user documentation..."
-    
-    cat > "$CONFIG_PATH/wireguard/clients/${username}_info.txt" << EOF
-VPN User Information
-===================
-
-User Details:
-- Username: $username
-- Email: $email
-- IP Address: $client_ip
-- Created: $(date)
-
-Configuration Files:
-- WireGuard Config: ${username}.conf
-- QR Code: ${username}_qr.png
-- Certificate: ${username}.crt
-
-Setup Instructions:
-1. Download WireGuard client for your device
-2. Import the configuration file or scan the QR code
-3. Connect to the VPN
-4. Access https://${AUTH_DOMAIN:-auth.$DOMAIN} to set up 2FA
-
-Security Notes:
-- Keep your private key secure
-- Enable 2FA for enhanced security
-- Report any suspicious activity immediately
-
-Support:
-- Email: ${ADMIN_EMAIL:-admin@example.com}
-- Documentation: https://github.com/Xieonie/zero-trust-vpn-infrastructure
-EOF
-    
-    log "✓ User documentation created"
-}
-
-# Log user creation
-log_user_creation() {
-    local username="$1"
-    local email="$2"
-    local user_group="$3"
-    local is_admin="$4"
-    local client_ip="$5"
-    
-    local log_entry="$(date '+%Y-%m-%d %H:%M:%S') - User created: $username ($email) - IP: $client_ip - Group: $user_group - Admin: $is_admin"
-    echo "$log_entry" >> "$CONFIG_PATH/logs/user_management.log"
-    
-    # Send notification to admin
-    if [[ -n "${ADMIN_EMAIL:-}" ]]; then
-        echo "New VPN user created: $username ($email)" | mail -s "VPN User Created" "${ADMIN_EMAIL}" 2>/dev/null || true
-    fi
-}
-
-# Main function
-main() {
-    local username="$1"
-    local email="$2"
-    local user_group="${3:-users}"
-    local is_admin="${4:-false}"
-    
-    log "Creating VPN user: $username"
-    
-    # Validate input
-    validate_input "$username" "$email"
-    
-    # Create necessary directories
-    mkdir -p "$CONFIG_PATH/wireguard/clients"
-    mkdir -p "$CONFIG_PATH/authelia"
-    mkdir -p "$CONFIG_PATH/logs"
-    mkdir -p "$CERTS_PATH/clients"
-    
-    # Get client IP
-    local client_ip=$(get_next_ip)
-    
-    # Create client configuration
-    create_client_config "$username" "$email" "$user_group" "$is_admin"
-    
-    # Generate client certificate
-    if [[ -f "$CERTS_PATH/ca/ca.crt" ]]; then
-        # Generate client private key first
-        openssl genrsa -out "$CERTS_PATH/clients/${username}_private.key" 2048
-        chmod 600 "$CERTS_PATH/clients/${username}_private.key"
-        
-        generate_client_certificate "$username" "$email"
-    else
-        warning "CA certificate not found. Skipping client certificate generation."
-    fi
-    
-    # Add user to Authelia
-    add_user_to_authelia "$username" "$email" "$user_group" "$is_admin"
-    
-    # Generate QR code
-    generate_qr_code "$username"
-    
-    # Create documentation
-    create_user_documentation "$username" "$email" "$client_ip"
-    
-    # Log creation
-    log_user_creation "$username" "$email" "$user_group" "$is_admin" "$client_ip"
-    
-    # Send welcome email
-    local temp_password=$(grep -A 10 "^  $username:" "$CONFIG_PATH/authelia/users_database.yml" | grep "password:" | cut -d'"' -f2 | head -1)
-    send_welcome_email "$username" "$email" "$temp_password"
-    
-    log "User '$username' created successfully!"
-    echo ""
-    echo "User Information:"
-    echo "================"
-    echo "Username: $username"
-    echo "Email: $email"
-    echo "IP Address: $client_ip"
-    echo "Group: $user_group"
-    echo "Admin: $is_admin"
-    echo ""
-    echo "Files created:"
-    echo "=============="
-    echo "- Configuration: $CONFIG_PATH/wireguard/clients/${username}.conf"
-    echo "- QR Code: $CONFIG_PATH/wireguard/clients/${username}_qr.png"
-    echo "- Documentation: $CONFIG_PATH/wireguard/clients/${username}_info.txt"
-    echo ""
-    echo "Next steps:"
-    echo "==========="
-    echo "1. Send configuration file to user"
-    echo "2. User should change temporary password"
-    echo "3. User should set up 2FA"
-    echo "4. Test VPN connection"
-}
-
-# Parse command line arguments
-if [[ $# -lt 2 ]]; then
-    show_usage
-    exit 1
-fi
-
-USERNAME="$1"
-EMAIL="$2"
-shift 2
-
-USER_GROUP="users"
-IS_ADMIN="false"
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --admin)
-            IS_ADMIN="true"
-            USER_GROUP="admins"
-            shift
-            ;;
-        --group)
-            USER_GROUP="$2"
-            shift 2
-            ;;
-        --help|-h)
-            show_usage
-            exit 0
-            ;;
-        *)
-            error "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
+positional=()
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --name)    need_value "$@"; DISPLAY_NAME="$2"; shift 2 ;;
+        --groups)  need_value "$@"; EXTRA_GROUPS="$2"; shift 2 ;;
+        --device)  need_value "$@"; DEVICE="$2"; shift 2 ;;
+        --admin)   ADMIN=1; shift ;;
+        --cert)    WANT_CERT=1; shift ;;
+        --qr)      WANT_QR=1; shift ;;
+        --no-vpn)  WANT_VPN=0; shift ;;
+        --) shift; positional+=("$@"); break ;;
+        -*) die "Unknown option: $1 (see --help)" ;;
+        *)  positional+=("$1"); shift ;;
     esac
 done
+((${#positional[@]} == 2)) || { usage >&2; exit 1; }
+USERNAME="${positional[0]}"
+EMAIL="${positional[1]}"
+DISPLAY_NAME="${DISPLAY_NAME:-$USERNAME}"
 
-# Check if running as root or VPN user
-if [[ $EUID -ne 0 && $(whoami) != "${VPN_USER:-vpn}" ]]; then
-    error "This script must be run as root or the VPN user"
-    exit 1
+# --------------------------------------------------------------------------
+# Validation (nothing is touched before all of this passed)
+# --------------------------------------------------------------------------
+
+is_known_group() {
+    local g
+    while IFS= read -r g; do [[ "$g" == "$1" ]] && return 0; done < <(split_csv "$KNOWN_GROUPS")
+    return 1
+}
+
+# "--" separates user and device in peer names, so it may not appear in a username.
+validate_username "$USERNAME" && [[ "$USERNAME" != *--* ]] || die "Invalid username: $USERNAME"
+validate_email "$EMAIL" || die "Invalid email: $EMAIL"
+validate_display_name "$DISPLAY_NAME" || die "Invalid display name"
+if [[ -n "$DEVICE" ]]; then
+    validate_device_name "$DEVICE" || die "Invalid device name: $DEVICE"
+fi
+if ((!WANT_VPN)); then
+    [[ -z "$DEVICE" ]] || die "--device needs a WireGuard peer; drop --no-vpn"
+    ((!WANT_QR)) || die "--qr needs a WireGuard peer; drop --no-vpn"
 fi
 
-main "$USERNAME" "$EMAIL" "$USER_GROUP" "$IS_ADMIN"
+declare -a GROUPS_LIST=()
+declare -A seen=()
+while IFS= read -r g; do
+    validate_group "$g" || die "Invalid group name: $g"
+    is_known_group "$g" || die "Unknown group: $g (allowed: $KNOWN_GROUPS)"
+    [[ -n "${seen[$g]:-}" ]] && continue
+    seen[$g]=1
+    GROUPS_LIST+=("$g")
+done < <(split_csv "$DEFAULT_USER_GROUPS"; split_csv "$EXTRA_GROUPS"; ((ADMIN)) && echo admins)
+GROUPS_CSV="$(IFS=,; printf '%s' "${GROUPS_LIST[*]}")"
+
+PEER="$USERNAME${DEVICE:+--$DEVICE}"
+validate_peer_name "$PEER" || die "Invalid peer name: $PEER"
+CERT_CN="$PEER"
+
+require_root
+require_cmd jq yq openssl flock
+require_yq || exit 1
+[[ "$AUTHELIA_BACKEND" == file ]] && require_cmd argon2
+((WANT_VPN)) && require_cmd wg
+((WANT_QR)) && require_cmd qrencode
+
+if ((WANT_VPN)); then
+    [[ -f "$WG_CONF" ]] || die "$WG_CONF not found; run wireguard-setup.sh first"
+    [[ "$(cat "$WG_SERVER_PUBKEY" 2>/dev/null)" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] ||
+        die "Server public key $WG_SERVER_PUBKEY is missing or invalid"
+fi
+if ((WANT_CERT)); then
+    pki_ca_exists || die "No CA at $PKI_CA_DIR; run pki-setup.sh first"
+    ((${#CERT_CN} <= 64)) || die "Certificate name $CERT_CN is longer than 64 characters"
+fi
+
+# --------------------------------------------------------------------------
+# Helpers (candidates for the shared lib)
+# --------------------------------------------------------------------------
+
+audit() {
+    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
+        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
+            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
+}
+
+inventory_init() {
+    [[ -f "$DEVICE_INVENTORY" ]] && return 0
+    mkdir -p "$(dirname "$DEVICE_INVENTORY")"
+    printf '{"devices": []}\n' | atomic_write "$DEVICE_INVENTORY" 600
+}
+
+# inventory_edit <constant jq program> [jq --arg ...]
+inventory_edit() {
+    local prog="$1" out
+    shift
+    out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
+    printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
+}
+
+# --------------------------------------------------------------------------
+# Transaction
+# --------------------------------------------------------------------------
+
+COMMITTED=0 USER_CREATED=0 PEER_ATTEMPTED=0 CERT_ATTEMPTED=0 INVENTORY_ADDED=0
+QR_FILE="" ONBOARDING_FILE=""
+
+rollback() {
+    local rc=$?
+    ((COMMITTED)) && return 0
+    set +e
+    ((rc == 0)) && rc=1
+    if ((USER_CREATED || PEER_ATTEMPTED || CERT_ATTEMPTED)); then
+        warn "Rolling back partial creation of $USERNAME"
+    fi
+    [[ -n "$ONBOARDING_FILE" ]] && rm -f "$ONBOARDING_FILE"
+    [[ -n "$QR_FILE" ]] && rm -f "$QR_FILE"
+    if ((INVENTORY_ADDED)); then
+        inventory_edit '.devices |= map(select(.id != $id))' --arg id "$PEER" ||
+            error "Rollback: could not remove $PEER from $DEVICE_INVENTORY"
+    fi
+    if ((CERT_ATTEMPTED)); then
+        pki_revoke "$CERT_CN" cessationOfOperation
+        case $? in
+            0|2) rm -f "$PKI_CLIENTS_DIR/$CERT_CN.key" "$PKI_CLIENTS_DIR/$CERT_CN.crt" ;;
+            *) error "Rollback: could not revoke certificate $CERT_CN; revoke it manually" ;;
+        esac
+    fi
+    if ((PEER_ATTEMPTED)); then
+        if wg_peer_exists "$PEER" || [[ -e "$WG_CLIENTS_DIR/$PEER" ]]; then
+            wg_deprovision_peer "$PEER" || error "Rollback: could not remove peer $PEER"
+            wg_apply || error "Rollback: could not apply $WG_CONF"
+        fi
+    fi
+    if ((USER_CREATED)); then
+        authelia_delete_user "$USERNAME" || error "Rollback: could not delete Authelia user $USERNAME"
+    fi
+    exit "$rc"
+}
+
+ztvpn_lock users
+((WANT_VPN)) && ztvpn_lock wg
+((WANT_CERT)) && ztvpn_lock pki
+((WANT_VPN)) && ztvpn_lock inventory
+
+# Checks that need the locks.
+if [[ "$AUTHELIA_BACKEND" == file ]]; then
+    authelia_user_exists "$USERNAME" && die "Authelia user $USERNAME already exists (use device-enrollment.sh to add devices)"
+fi
+if ((WANT_VPN)); then
+    [[ -z "$(wg_user_peers "$USERNAME")" ]] || die "WireGuard peers for $USERNAME already exist (use device-enrollment.sh)"
+    [[ ! -e "$WG_CLIENTS_DIR/$PEER" ]] || die "$WG_CLIENTS_DIR/$PEER already exists"
+fi
+if ((WANT_CERT)) && [[ -n "$(pki_valid_serials "$CERT_CN")" ]]; then
+    die "A valid certificate for $CERT_CN already exists; revoke it first"
+fi
+
+trap rollback EXIT
+
+# 1. Account
+PASSWORD=""
+case "$AUTHELIA_BACKEND" in
+    file)
+        PASSWORD="$(gen_password 20)"
+        HASH="$(printf '%s\n' "$PASSWORD" | authelia_hash_password)"
+        authelia_add_user "$USERNAME" "$DISPLAY_NAME" "$EMAIL" "$HASH" "$GROUPS_CSV"
+        USER_CREATED=1
+        unset HASH
+        success "Authelia user $USERNAME created (groups: $GROUPS_CSV)"
+        ;;
+    ldap)
+        warn "MANUAL: AUTHELIA_BACKEND=ldap; create $USERNAME in the directory with groups $GROUPS_CSV"
+        ;;
+    *) die "Unsupported AUTHELIA_BACKEND: $AUTHELIA_BACKEND" ;;
+esac
+
+# 2. WireGuard peer
+IP="" CLIENT_CONF=""
+if ((WANT_VPN)); then
+    PEER_ATTEMPTED=1
+    IP="$(wg_provision_peer "$PEER")"
+    validate_ipv4 "$IP" || die "Peer provisioning returned an invalid address"
+    CLIENT_CONF="$WG_CLIENTS_DIR/$PEER/$PEER.conf"
+    wg_apply
+    success "WireGuard peer $PEER added with $IP"
+fi
+
+# 3. Client certificate
+CERT=""
+if ((WANT_CERT)); then
+    CERT_ATTEMPTED=1
+    CERT="$(pki_issue client "$CERT_CN")"
+    success "Client certificate issued: $CERT"
+fi
+
+# 4. QR code (file read by qrencode itself, the key never hits argv)
+if ((WANT_QR)); then
+    QR_FILE="$WG_CLIENTS_DIR/$PEER/$PEER.png"
+    (umask 077; qrencode -t PNG -r "$CLIENT_CONF" -o "$QR_FILE")
+    chmod 600 "$QR_FILE"
+fi
+
+# 5. Device inventory
+if ((WANT_VPN)); then
+    inventory_init
+    inventory_edit '.devices += [{
+            id: $id, username: $user, device_name: (if $dev == "" then null else $dev end),
+            device_type: "unknown", peer: $id, ip_address: $ip, public_key: $pub,
+            certificate: (if $cert == "" then null else $cert end),
+            enrolled_date: $ts, status: "active"}]' \
+        --arg id "$PEER" --arg user "$USERNAME" --arg dev "$DEVICE" --arg ip "$IP" \
+        --arg pub "$(<"$WG_CLIENTS_DIR/$PEER/public.key")" --arg cert "$CERT" --arg ts "$(date -Iseconds)"
+    INVENTORY_ADDED=1
+fi
+
+# 6. Onboarding file with the one-time credentials
+if [[ -n "$PASSWORD" ]]; then
+    (umask 077; mkdir -p "$ZTVPN_SECRETS_DIR/onboarding")
+    chmod 700 "$ZTVPN_SECRETS_DIR/onboarding"
+    ONBOARDING_FILE="$ZTVPN_SECRETS_DIR/onboarding/$USERNAME-$(date +%Y%m%dT%H%M%S).txt"
+    {
+        printf 'Zero Trust VPN onboarding for %s\n\n' "$USERNAME"
+        printf 'Login:              https://%s\n' "$AUTH_DOMAIN"
+        printf 'Username:           %s\n' "$USERNAME"
+        printf 'One-time password:  %s\n' "$PASSWORD"
+        printf '\nChange the password and enrol a second factor at first login.\n'
+        [[ -n "$CLIENT_CONF" ]] && printf 'WireGuard config:   %s\n' "$CLIENT_CONF"
+        [[ -n "$QR_FILE" ]] && printf 'WireGuard QR code:  %s\n' "$QR_FILE"
+        [[ -n "$CERT" ]] && printf 'Client certificate: %s (key: %s)\n' "$CERT" "$PKI_CLIENTS_DIR/$CERT_CN.key"
+        printf '\nDeliver over a secure channel and delete this file afterwards.\n'
+    } | atomic_write "$ONBOARDING_FILE" 600
+fi
+unset PASSWORD
+
+audit add-user "user=$USERNAME peer=${IP:+$PEER} ip=$IP groups=$GROUPS_CSV cert=$WANT_CERT backend=$AUTHELIA_BACKEND"
+COMMITTED=1
+trap - EXIT
+
+success "User $USERNAME created"
+printf 'user=%s\n' "$USERNAME"
+if ((WANT_VPN)); then
+    printf 'peer=%s\nip=%s\nclient_config=%s\n' "$PEER" "$IP" "$CLIENT_CONF"
+fi
+[[ -n "$CERT" ]] && printf 'cert=%s\n' "$CERT"
+[[ -n "$QR_FILE" ]] && printf 'qr=%s\n' "$QR_FILE"
+[[ -n "$ONBOARDING_FILE" ]] && printf 'onboarding=%s\n' "$ONBOARDING_FILE"
+exit 0

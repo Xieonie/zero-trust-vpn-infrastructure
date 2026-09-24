@@ -104,12 +104,15 @@ wg_add_peer() {
 wg_remove_peer() {
     local name="$1"
     wg_peer_exists "$name" || return 1
+    # wg_add_peer writes one blank line before each block; drop it together
+    # with the block so add followed by remove restores the file exactly.
     awk -v b="# BEGIN PEER $name" -v e="# END PEER $name" '
-        $0 == b { skip = 1; next }
-        skip && $0 == e { skip = 0; drop_blank = 1; next }
+        $0 == b { skip = 1; pending = 0; next }
+        skip && $0 == e { skip = 0; next }
         skip { next }
-        drop_blank && /^[[:space:]]*$/ { drop_blank = 0; next }
-        { drop_blank = 0; print }
+        /^[[:space:]]*$/ { if (pending) print ""; pending = 1; next }
+        { if (pending) print ""; pending = 0; print }
+        END { if (pending) print "" }
     ' "$WG_CONF" | atomic_write "$WG_CONF" 600
 }
 
