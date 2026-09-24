@@ -16,7 +16,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck bats wireguard-tools argon2 jq openssl
+          sudo apt-get install -y --no-install-recommends shellcheck bats wireguard-tools wireguard-go iproute2 nftables argon2 jq openssl qrencode
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
@@ -30,11 +30,17 @@ jobs:
 
       - name: No LFS pointers in scripts
         run: |
-          ! grep -rl '^version https://git-lfs.github.com/spec' --include='*.sh' .
+          if grep -rl '^version https://git-lfs.github.com/spec' --include='*.sh' .; then
+            echo "Scripts must be stored as regular files, not Git LFS pointers" >&2
+            exit 1
+          fi
 
       - name: YAML is well-formed
         run: |
           for f in $(git ls-files '*.yml' '*.yaml'); do yq '.' "$f" >/dev/null || exit 1; done
 
+      - name: Pull Authelia image for config validation tests
+        run: docker pull authelia/authelia:4.39
+
       - name: bats
-        run: sudo -E bats tests/
+        run: sudo -E env "PATH=$PATH" bats tests/
