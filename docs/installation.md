@@ -12,8 +12,9 @@ This guide installs the complete stack on one Debian or Ubuntu host with
 - A public address or DNS name for `VPN_ENDPOINT`; UDP `WG_PORT` (default
   51820) reachable from clients.
 - An address of this host inside `SERVICES_SUBNET` (default `10.0.1.0/24`),
-  normally its LAN address. VPN clients reach nginx on that address.
-  `firewall-setup.sh` warns if the host has none.
+  normally its LAN address. nginx is published only on that address
+  (`PROXY_BIND_ADDR`, detected automatically); `initial-setup.sh` refuses to
+  deploy without one.
 - Name resolution for clients: `AUTH_DOMAIN` and every application name
   (`grafana.<DOMAIN>`, ...) must resolve, on the VPN clients, to the address
   above. Nothing in this repository runs a resolver. Options: records in a DNS
@@ -62,7 +63,8 @@ it. Environment variables override values in the file.
 | `WG_INTERFACE` / `WG_PORT` | `wg0` / `51820` | |
 | `ADMIN_ALLOWLIST` | empty | IPs/CIDRs (v4 or v6) allowed to SSH in and never auto-blocked. Empty = SSH open to all, rate limited |
 | `SSH_PORT` | `22` | |
-| `PUBLIC_TCP_PORTS` | `80,443` | Only for a proxy running natively on the host; Docker-published ports are handled by Docker |
+| `PROXY_BIND_ADDR` | empty (auto) | Host address in `SERVICES_SUBNET` that nginx publishes 80/443 on |
+| `PUBLIC_TCP_PORTS` | empty | TCP ports open to everyone, only for services running natively on the host |
 | `WG_INPUT_PORTS` | empty | Ports on `VPN_SERVER_IP` clients may use (e.g. `53`) |
 | `FULL_TUNNEL` | `no` | `yes` allows internet egress through the tunnel (also set `CLIENT_ALLOWED_IPS=0.0.0.0/0, ::/0`) |
 | `SERVICES_NAT` | `no` | See [architecture](architecture.md#firewall-contract) before changing |

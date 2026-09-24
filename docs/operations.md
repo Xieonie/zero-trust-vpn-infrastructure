@@ -67,11 +67,18 @@ failure. Authelia picks up the users file by itself (`watch: true`).
 
 ### Passwords and re-enabling
 
-There is no script to set a new password or to re-enable a disabled
-account, and the portal's password change/reset is disabled. For now this
-means editing `/opt/zero-trust-vpn/authelia/users_database.yml` by hand
-(keep mode 600), for example setting `disabled: false` for a user, and
-checking the result with `scripts/management/policy-update.sh validate`.
+The portal's password change/reset is disabled (the scripts own the users
+file). Admins handle it:
+
+```sh
+scripts/management/user-account.sh reset-password alice   # new random password -> 0600 onboarding file
+scripts/management/user-account.sh disable alice          # account only; peers and certificates stay
+scripts/management/user-account.sh enable alice           # peers/certs removed by revoke-user are not restored
+scripts/management/user-account.sh show alice             # JSON without the hash
+```
+
+File backend only. After `enable`, enrol devices again with
+`device-enrollment.sh enroll`.
 
 ## Devices
 
@@ -263,10 +270,9 @@ scripts/automation/threat-response.sh release --ip 10.8.0.14
 - Never blocked: `ADMIN_ALLOWLIST`, `VPN_SERVER_IP`, loopback, the host's own
   addresses, the SSH client running the script, and RFC 1918 ranges when
   `THREAT_PROTECT_PRIVATE=yes`.
-- Blocking also deletes the address's established connections with
-  `conntrack` (installed by `initial-setup.sh`). Without it only new
-  connections are dropped, an active WireGuard session or HTTP keep-alive
-  stays up, and the incident record says so.
+- Blocking cuts established connections too: the `input` chain drops
+  blocklisted sources before it accepts established traffic. `conntrack`
+  (installed by `initial-setup.sh`) additionally clears NAT state.
 - `--notify` sends to `SLACK_WEBHOOK` and/or `NOTIFICATION_EMAIL` (via
   `sendmail`).
 - `release --device` puts a removed peer back with its old keys and address
@@ -279,8 +285,12 @@ scripts/automation/threat-response.sh release --ip 10.8.0.14
   (for example `mv /var/lib/zero-trust-vpn/quarantine/alice--laptop /var/lib/zero-trust-vpn/quarantine/alice--laptop.retired`)
   and remove the address from the set:
   `nft delete element inet ztvpn quarantine4 '{ 10.8.0.3 }'`.
-- Blocklist and quarantine entries are lost on reboot (see README
-  limitations).
+- Every change to the blocklists and the quarantine set is saved to
+  `/var/lib/zero-trust-vpn/firewall/dynamic-sets` (with absolute expiry).
+  `ztvpn-firewall-state.service` restores them at boot after
+  `nftables.service`; `firewall-setup.sh --apply` merges live and saved
+  entries; `firewall-setup.sh --restore-state` does it by hand. Entries added
+  with plain `nft add element` are not saved.
 
 ## Directory reconciliation (LDAP / AD)
 

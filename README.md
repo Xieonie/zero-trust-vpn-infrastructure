@@ -103,11 +103,11 @@ Read these before relying on the setup.
   treats all peers the same: every peer can reach
   `SERVICES_SUBNET:SERVICES_PORTS`. Adding a port there that is not behind
   nginx and Authelia exposes it to every peer without authentication.
-- **nginx publishes 80/443 on all host interfaces.** Docker's DNAT bypasses
-  the `input` chain, so the proxy is reachable from the internet at the TCP
-  level. For known host names nginx completes the TLS handshake and answers
-  403 to non-VPN addresses (`vpn-only.inc`); unknown names get no handshake.
-  `PUBLIC_TCP_PORTS` only affects a proxy running natively on the host.
+- **nginx is published only on `PROXY_BIND_ADDR`**, this host's address in
+  `SERVICES_SUBNET` (Docker's DNAT bypasses the `input` chain, so binding to
+  `0.0.0.0` would expose it). Hosts on that LAN can reach the proxy at the TCP
+  level; nginx answers 403 to non-VPN addresses (`vpn-only.inc`) and
+  Authelia's rules only match the `vpn` network.
 - **Disabling a user is not instant for web sessions.** Authelia re-reads the
   user after `refresh_interval` (1 minute in the shipped config). Tunnels are
   cut immediately because peers are removed from the running interface.
@@ -115,14 +115,9 @@ Read these before relying on the setup.
   `revoke-user.sh` can disable one only through an `LDAP_DISABLE_HOOK` you
   provide; otherwise it exits 2 and reports the manual step.
   `user-sync.sh` reconciles VPN access with the directory.
-- **No password change or account re-enable.** Password change and reset in
-  the portal are disabled because the users file is managed by the scripts,
-  and no script sets a new password or re-enables a disabled account. The
-  onboarding files tell users to change their password at first login; the
-  shipped configuration does not allow that.
-- **Blocklist and quarantine entries are not persistent.** They are carried
-  over when `firewall-setup.sh --apply` re-applies the table, but a reboot or
-  an nftables reload empties the sets.
+- **Users cannot change their own password.** The portal's change and reset
+  flows are disabled because the scripts own the users file. Admins issue a
+  new random password with `user-account.sh reset-password`.
 - **Traffic from nginx to upstreams is plain HTTP** on the Docker network.
 - **The tunnel is IPv4 only.** IPv6 arriving through the tunnel is dropped.
 - **The CA key is encrypted, but its passphrase is on the same host**
@@ -207,11 +202,12 @@ Details and examples: [docs/operations.md](docs/operations.md).
 |---|---|
 | `scripts/setup/initial-setup.sh` | Packages, directories, runs the four setup steps, deploys compose + nginx files, starts the stack. Safe to re-run. |
 | `scripts/setup/pki-setup.sh` | Creates the CA (never replaces it without `--force`), issues/renews the proxy certificate, regenerates the CRL. |
-| `scripts/setup/firewall-setup.sh` | Renders (`--print`) or applies (`--apply`) the `inet ztvpn` nftables table, with optional rollback timer. |
+| `scripts/setup/firewall-setup.sh` | Renders (`--print`) or applies (`--apply`) the `inet ztvpn` nftables table, with optional rollback timer; `--restore-state` re-adds saved blocklist/quarantine entries (run at boot by `ztvpn-firewall-state.service`). |
 | `scripts/setup/wireguard-setup.sh` | Server keys, `[Interface]` of `wg0.conf` (peers kept), IPv4 forwarding, `wg-quick@wg0`. |
 | `scripts/setup/authelia-setup.sh` | Authelia config, secret files, users file and first admin; `--validate` runs `authelia validate-config`. |
 | `scripts/management/add-user.sh` | Authelia account with random password + first WireGuard peer (optional client cert, QR). Rolls back on failure. |
 | `scripts/management/revoke-user.sh` | Disables/deletes the account, removes all peers of the user, revokes their certificates, marks inventory. |
+| `scripts/management/user-account.sh` | `reset-password`, `enable`, `disable`, `show` for Authelia file-backend accounts. |
 | `scripts/management/device-enrollment.sh` | `enroll`, `remove`, `list`, `show` additional devices (`<user>--<device>` peers). |
 | `scripts/management/policy-update.sh` | Access-control rules and group membership in the live Authelia config, validated with rollback; backup/restore. |
 | `scripts/automation/cert-renewal.sh` | `check` expiry (exit 0/1/2), `renew` server certificates and reload nginx. |
@@ -248,7 +244,7 @@ and canonical paths are in `scripts/lib/common.sh`:
 ```
 scripts/lib/          common.sh (config, paths, validation, audit log), wireguard.sh, authelia.sh, pki.sh
 scripts/setup/        initial-setup, pki-setup, firewall-setup, wireguard-setup, authelia-setup
-scripts/management/   add-user, revoke-user, device-enrollment, policy-update
+scripts/management/   add-user, revoke-user, user-account, device-enrollment, policy-update
 scripts/automation/   cert-renewal, threat-response, user-sync
 scripts/monitoring/   connection-monitor, security-audit, compliance-check
 config-examples/      ztvpn.conf.example

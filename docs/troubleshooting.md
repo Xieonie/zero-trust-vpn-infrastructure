@@ -199,8 +199,11 @@ ls -lt /var/backups/zero-trust-vpn/firewall/
   `/etc/nftables.conf` with `flush ruleset` removed Docker's rules.
   `systemctl restart docker` recreates them. Re-apply this project's table
   with `scripts/setup/firewall-setup.sh --apply`.
-- **Blocks or quarantines disappeared**: they are not persisted and are
-  cleared by a reboot or an nftables reload.
+- **Blocks or quarantines disappeared** after a reboot or nftables reload:
+  check `systemctl status ztvpn-firewall-state.service` and run
+  `scripts/setup/firewall-setup.sh --restore-state`. The saved state is
+  `/var/lib/zero-trust-vpn/firewall/dynamic-sets`; expired entries are
+  skipped on purpose.
 
 ## Certificates and CRL
 

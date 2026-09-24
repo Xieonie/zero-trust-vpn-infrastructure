@@ -85,7 +85,7 @@ only that table atomically. Docker's and other tables are not touched.
 
 | Chain | Hook / policy | Content |
 |---|---|---|
-| `input` | input, drop | loopback; quarantined tunnel sources dropped; established/related; blocklists; `wg0` traffic to `wg_input`; limited ICMP/ICMPv6; UDP `WG_PORT`; SSH `SSH_PORT` rate limited per source and restricted to `ADMIN_ALLOWLIST` if set; `PUBLIC_TCP_PORTS` |
+| `input` | input, drop | loopback; quarantined tunnel sources and blocklists dropped (before established/related, so blocking cuts open connections); established/related; `wg0` traffic to `wg_input`; limited ICMP/ICMPv6; UDP `WG_PORT`; SSH `SSH_PORT` rate limited per source and restricted to `ADMIN_ALLOWLIST` if set; `PUBLIC_TCP_PORTS` |
 | `wg_input` | regular chain | IPv6 dropped, source must be in `VPN_SUBNET`, echo to `VPN_SERVER_IP`, `WG_INPUT_PORTS` (tcp+udp) on `VPN_SERVER_IP`, `SERVICES_SUBNET:SERVICES_PORTS`, then drop |
 | `forward` | forward, accept | blocklists; `iifname wg0` to `wg_forward`, `oifname wg0` to `wg_forward_out`. Policy accept because Docker filters its bridge traffic in its own tables. |
 | `wg_forward` | regular chain | quarantine; established; IPv6 drop; source must be in `VPN_SUBNET`; no client-to-client; `ct original` destination in `SERVICES_SUBNET` on `SERVICES_PORTS`; with `FULL_TUNNEL=yes` internet except private/special ranges; then drop |
