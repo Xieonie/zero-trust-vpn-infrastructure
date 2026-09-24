@@ -201,7 +201,10 @@ calls() { cat "$STUB_LOG/$1" 2>/dev/null || true; }
     run --separate-stderr "$THREAT" --type brute-force --ip 203.0.113.9 --duration 2h --reason "ssh scan"
     [ "$status" -eq 0 ]
     [[ "$output" =~ ^INC-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$ ]]
-    [ "$(calls nft)" = "add element inet ztvpn blocklist4 { 203.0.113.9 timeout 2h }" ]
+    [ "$(calls nft | grep -v '^-j list set ')" = "add element inet ztvpn blocklist4 { 203.0.113.9 timeout 2h }" ]
+    # State is saved for restore after reboot
+    calls nft | grep -q '^-j list set inet ztvpn blocklist4$'
+    [ -f "$ZTVPN_STATE_DIR/firewall/dynamic-sets" ]
     rec="$ZTVPN_STATE_DIR/incidents/$output.json"
     [ "$(stat -c %a "$rec")" = "600" ]
     [ "$(jq -r .id "$rec")" = "$output" ]

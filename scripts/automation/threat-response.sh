@@ -13,7 +13,6 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/threat-response.log}"
 INCIDENT_DIR="${INCIDENT_DIR:-$ZTVPN_STATE_DIR/incidents}"
-NFT_TABLE="${NFT_TABLE:-ztvpn}"
 # Also protect RFC1918 ranges from blocking (yes/no).
 THREAT_PROTECT_PRIVATE="${THREAT_PROTECT_PRIVATE:-no}"
 THREAT_MAX_BLOCK="${THREAT_MAX_BLOCK:-30d}"
@@ -189,28 +188,31 @@ block_ip() {
     local ip="$1" dur="$2" set
     set="$(nft_set_for "$ip")"
     nft add element inet "$NFT_TABLE" "$set" "{ $ip timeout $dur }" || return 1
-    # Established flows are accepted before the blocklist; drop them too.
-    # Without conntrack they keep flowing (e.g. an active WireGuard session
-    # or HTTP keep-alive stays up for as long as it has traffic).
+    save_fw_state
+    # The input chain drops blocklisted sources before accepting established
+    # traffic; flushing conntrack also clears NAT/forward state right away.
     if command -v conntrack >/dev/null 2>&1; then
         conntrack -D -s "$ip" >/dev/null 2>&1 || true
-        echo "added to $set, expires after $dur, established connections flushed"
-    else
-        warn "conntrack not installed: established connections from $ip are NOT cut (install the conntrack package)"
-        echo "added to $set, expires after $dur; established connections NOT flushed (conntrack missing)"
     fi
+    echo "added to $set, expires after $dur"
+}
+
+save_fw_state() {
+    fw_save_state || warn "Could not save firewall state to $FW_STATE_FILE; the entry is lost on reboot"
 }
 
 unblock_ip() {
     local ip="$1" set
     set="$(nft_set_for "$ip")"
     nft delete element inet "$NFT_TABLE" "$set" "{ $ip }" || return 1
+    save_fw_state
     echo "removed from $set"
 }
 
 quarantine_ip_plan() { echo "nft add element inet $NFT_TABLE quarantine4 { $1 }"; }
 quarantine_ip() {
     nft add element inet "$NFT_TABLE" quarantine4 "{ $1 }" || return 1
+    save_fw_state
     echo "added to quarantine4"
 }
 
@@ -364,6 +366,7 @@ cmd_release() {
         if [[ -z "$peer" ]]; then
             # Quarantined only (suspicious-traffic), peer was kept.
             nft delete element inet "$NFT_TABLE" quarantine4 "{ $ip }" || die "Could not remove $ip from quarantine4"
+            save_fw_state
             success "Released $ip from quarantine4"
             return 0
         fi
@@ -399,6 +402,7 @@ cmd_release() {
     fi
     wg_apply || warn "Could not apply $WG_CONF to $WG_INTERFACE"
     nft delete element inet "$NFT_TABLE" quarantine4 "{ $pip }" || warn "$pip was not in quarantine4"
+    save_fw_state
     success "Released $peer ($pip). Its keys were in quarantine; re-enroll the device if compromise is confirmed."
 }
 

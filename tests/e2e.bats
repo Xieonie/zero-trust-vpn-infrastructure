@@ -393,13 +393,18 @@ in_set() { srv nft -j list set inet ztvpn "$1" | jq -e --arg ip "$2" '[.nftables
     # New connections from the blocked address are dropped.
     ! tcp_ok "$NS_CLI1" 192.0.2.1 22 || false
     ! ping_ok "$NS_CLI1" 192.0.2.1 1 || false
-    if command -v conntrack >/dev/null 2>&1; then
-        # Its established WireGuard flow was flushed as well.
-        ! ping_ok "$NS_CLI1" 10.8.0.1 2 || false
-    else
-        # Without conntrack the established flow survives; the operator must be told.
-        [[ "$stderr" == *"conntrack"* ]]
-    fi
+    # The blocklist sits before "established" in the input chain, so the
+    # already running WireGuard session is cut too (with or without conntrack).
+    ! ping_ok "$NS_CLI1" 10.8.0.1 2 || false
+
+    # The entry survives a ruleset reload / reboot: load the persisted file
+    # into an empty table, then restore the saved state as the boot unit does.
+    srv nft delete table inet ztvpn
+    srv nft -f "$NFT_RULES_FILE"
+    ! in_set blocklist4 192.0.2.2 || false
+    run script setup/firewall-setup.sh --restore-state
+    [ "$status" -eq 0 ]
+    in_set blocklist4 192.0.2.2
     # A fresh WireGuard session (new source port) cannot handshake.
     client_down "$NS_CLI1" "$WG_IF_CLI1"
     client_up "$NS_CLI1" "$WG_IF_CLI1" "$BATS_FILE_TMPDIR/alice.conf"

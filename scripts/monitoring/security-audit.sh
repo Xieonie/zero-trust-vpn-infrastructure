@@ -11,7 +11,6 @@ set -Eeuo pipefail
 # shellcheck source=scripts/lib/common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-NFT_TABLE="${NFT_TABLE:-ztvpn}"
 # Host ports that may be published on all interfaces.
 AUDIT_PUBLIC_PORTS="${AUDIT_PUBLIC_PORTS:-80,443,$WG_PORT}"
 ZTVPN_PROC_DIR="${ZTVPN_PROC_DIR:-/proc}"

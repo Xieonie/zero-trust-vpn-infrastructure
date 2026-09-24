@@ -44,11 +44,14 @@ table inet ztvpn {
 		type filter hook input priority filter; policy drop;
 
 		iif "lo" accept
+		# Blocked and quarantined sources are dropped before the
+		# established rule, so blocking also cuts connections that are
+		# already open (threat-response never blocks ADMIN_ALLOWLIST).
 		iifname "wg0" ip saddr @quarantine4 drop
-		ct state established,related accept
-		ct state invalid drop
 		ip saddr @blocklist4 drop
 		ip6 saddr @blocklist6 drop
+		ct state established,related accept
+		ct state invalid drop
 
 		# Everything arriving through the tunnel is decided in wg_input.
 		iifname "wg0" jump wg_input
@@ -69,9 +72,6 @@ table inet ztvpn {
 		tcp dport 22 ct state new add @ssh_meter6 { ip6 saddr limit rate over 10/minute burst 10 packets } drop
 		# ADMIN_ALLOWLIST is empty: SSH is open to everyone (rate limited).
 		tcp dport 22 accept
-
-		# Reverse proxy listening on the host itself
-		tcp dport { 80, 443 } accept
 	}
 
 	# Traffic from VPN clients to this host.

@@ -78,18 +78,38 @@ need_root() {
     grep -A2 'set quarantine4 {' <<<"$out" | grep -q 'type ipv4_addr'
 }
 
-@test "input: policy drop, blocklists after lo/established, IPv4 and IPv6" {
+@test "input: policy drop, blocklists after lo but before established, IPv4 and IPv6" {
     input="$(render | chain input)"
     grep -q 'policy drop;' <<<"$input"
     lo=$(grep -n 'iif "lo" accept' <<<"$input" | cut -d: -f1)
     est=$(grep -n 'ct state established,related accept' <<<"$input" | cut -d: -f1)
     b4=$(grep -n 'ip saddr @blocklist4 drop' <<<"$input" | cut -d: -f1)
     b6=$(grep -n 'ip6 saddr @blocklist6 drop' <<<"$input" | cut -d: -f1)
-    ((lo < est && est < b4 && est < b6))
+    ((lo < b4 && lo < b6 && b4 < est && b6 < est))
     grep -q 'udp dport 51820 accept' <<<"$input"
     grep -q 'nd-neighbor-solicit' <<<"$input"
     grep -q 'packet-too-big' <<<"$input"
+    # No public TCP ports by default (the Docker proxy is bound to PROXY_BIND_ADDR)
+    ! grep -q 'tcp dport { 80' <<<"$input" || false
+    input="$(PUBLIC_TCP_PORTS=80,443 render | chain input)"
     grep -q 'tcp dport { 80, 443 } accept' <<<"$input"
+}
+
+@test "state: saved blocklist and quarantine entries are restored, expired ones are not" {
+    load_lib
+    mkdir -p "$(dirname "$FW_STATE_FILE")" "$QUARANTINE_DIR/mallory"
+    now=$(date +%s)
+    printf 'blocklist4 203.0.113.7 %s\nblocklist4 203.0.113.8 %s\nblocklist6 2001:db8::1 %s\nquarantine4 10.8.0.9 0\nblocklist4 bogus;x 0\n' \
+        $((now + 600)) $((now - 5)) $((now + 60)) >"$FW_STATE_FILE"
+    printf '{"ip":"10.8.0.7"}\n' >"$QUARANTINE_DIR/mallory/meta.json"
+    run fw_restore_commands
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"add element inet ztvpn blocklist4 { 203.0.113.7 timeout "* ]]
+    [[ "$output" != *"203.0.113.8"* ]]
+    [[ "$output" == *"blocklist6 { 2001:db8::1 timeout "* ]]
+    [[ "$output" == *"quarantine4 { 10.8.0.9 }"* ]]
+    [[ "$output" == *"quarantine4 { 10.8.0.7 }"* ]]
+    [[ "$output" != *"bogus"* ]]
 }
 
 @test "wg input: IPv6 dropped, only VPN_SERVER_IP:WG_INPUT_PORTS and services, then drop" {

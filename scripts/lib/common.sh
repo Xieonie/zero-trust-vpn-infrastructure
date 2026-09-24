@@ -101,6 +101,7 @@ ZTVPN_STATE_DIR="${ZTVPN_STATE_DIR:-/var/lib/zero-trust-vpn}"
 ZTVPN_LOG_DIR="${ZTVPN_LOG_DIR:-/var/log/zero-trust-vpn}"
 ZTVPN_BACKUP_DIR="${ZTVPN_BACKUP_DIR:-/var/backups/zero-trust-vpn}"
 ZTVPN_REPORT_DIR="${ZTVPN_REPORT_DIR:-$ZTVPN_STATE_DIR/reports}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 
 # Kept for the docker-compose .env, which uses these names.
 CONFIG_PATH="${CONFIG_PATH:-$ZTVPN_HOME}"
@@ -166,6 +167,10 @@ KNOWN_GROUPS="${KNOWN_GROUPS:-admins,security,it-support,employees,remote-worker
 # Inventory and runtime state
 DEVICE_INVENTORY="${DEVICE_INVENTORY:-$ZTVPN_STATE_DIR/device-inventory.json}"
 QUARANTINE_DIR="${QUARANTINE_DIR:-$ZTVPN_STATE_DIR/quarantine}"
+
+# nftables (scripts/setup/firewall-setup.sh renders "table inet $NFT_TABLE")
+NFT_TABLE="${NFT_TABLE:-ztvpn}"
+FW_STATE_FILE="${FW_STATE_FILE:-$ZTVPN_STATE_DIR/firewall/dynamic-sets}"
 
 # Compose deployment. Containers are addressed by compose service name;
 # set AUTHELIA_CONTAINER only if Authelia runs outside this compose project.
@@ -390,3 +395,5 @@ source "$ZTVPN_LIB_DIR/wireguard.sh"
 source "$ZTVPN_LIB_DIR/authelia.sh"
 # shellcheck source=scripts/lib/pki.sh
 source "$ZTVPN_LIB_DIR/pki.sh"
+# shellcheck source=scripts/lib/firewall.sh
+source "$ZTVPN_LIB_DIR/firewall.sh"

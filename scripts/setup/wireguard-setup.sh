@@ -13,7 +13,6 @@ set -Eeuo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
 ZTVPN_SYSCTL_FILE="${ZTVPN_SYSCTL_FILE:-/etc/sysctl.d/99-ztvpn.conf}"
-SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/wireguard-setup.log}"
 
 usage() {

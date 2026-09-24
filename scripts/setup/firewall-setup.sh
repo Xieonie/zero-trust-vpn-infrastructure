@@ -28,7 +28,7 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 # Local config keys (defaults; override in ztvpn.conf or the environment).
 SSH_PORT="${SSH_PORT:-22}"
 FULL_TUNNEL="${FULL_TUNNEL:-no}"
-PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS-80,443}"
+PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS-}"
 SERVICES_PORTS="${SERVICES_PORTS:-443}"
 WG_INPUT_PORTS="${WG_INPUT_PORTS:-}"
 SERVICES_NAT="${SERVICES_NAT:-no}"
@@ -37,11 +37,11 @@ NFTABLES_CONF="${NFTABLES_CONF:-/etc/nftables.conf}"
 FIREWALL_STATE_DIR="${FIREWALL_STATE_DIR:-$ZTVPN_STATE_DIR/firewall}"
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/firewall-setup.log}"
 
-NFT_TABLE="ztvpn"
+[[ "$NFT_TABLE" =~ ^[a-z][a-z0-9_]*$ ]] || die "Invalid NFT_TABLE: $NFT_TABLE"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--print | --apply [--confirm-timeout N]]
+Usage: $(basename "$0") [--print | --apply [--confirm-timeout N] | --restore-state]
 
 Render the nftables ruleset "table inet $NFT_TABLE" from ztvpn.conf.
 
@@ -57,6 +57,10 @@ Render the nftables ruleset "table inet $NFT_TABLE" from ztvpn.conf.
                         "touch $FIREWALL_STATE_DIR/confirm" (e.g. from a
                         second SSH session). Nothing is persisted before
                         confirmation. Recommended when working over SSH.
+  --restore-state       Re-add saved blocklist/quarantine entries (from
+                        $FW_STATE_FILE and active quarantine records) to the
+                        running table. Runs at boot via
+                        ztvpn-firewall-state.service, which --apply installs.
   -h, --help            Show this help
 
 Settings (ztvpn.conf or environment):
@@ -220,11 +224,14 @@ EOF
 		type filter hook input priority filter; policy drop;
 
 		iif "lo" accept
+		# Blocked and quarantined sources are dropped before the
+		# established rule, so blocking also cuts connections that are
+		# already open (threat-response never blocks ADMIN_ALLOWLIST).
 		iifname "$wg" ip saddr @quarantine4 drop
-		ct state established,related accept
-		ct state invalid drop
 		ip saddr @blocklist4 drop
 		ip6 saddr @blocklist6 drop
+		ct state established,related accept
+		ct state invalid drop
 
 		# Everything arriving through the tunnel is decided in wg_input.
 		iifname "$wg" jump wg_input
@@ -364,30 +371,49 @@ check_ssh_lockout() {
         die "Your SSH client $client is not in ADMIN_ALLOWLIST ($ADMIN_ALLOWLIST); applying would lock you out"
 }
 
-# Prints "add element" commands that carry the current dynamic set contents
-# (blocklists with their remaining timeout, quarantine) into the new table.
+# Prints "add element" commands for the new table: what is live now plus
+# what was saved (e.g. entries lost by a reboot or an nftables reload).
 carry_over_elements() {
-    local set json
-    for set in blocklist4 blocklist6 quarantine4; do
-        json="$(nft -j list set inet "$NFT_TABLE" "$set" 2>/dev/null)" || continue
-        jq -r --arg set "$set" '
-            .nftables[] | select(.set) | .set.elem // [] | .[]
-            | if type == "object" and .elem then [.elem.val, (.elem.expires // .elem.timeout // 0)]
-              else [., 0] end
-            | select(.[0] | type == "string") | "\(.[0]) \(.[1])"' <<<"$json" |
-            while read -r addr secs; do
-                case "$set" in
-                    blocklist6) validate_ipv6ish "$addr" || continue ;;
-                    *) validate_ipv4 "$addr" || continue ;;
-                esac
-                [[ "$secs" =~ ^[0-9]+$ ]] || continue
-                if [[ "$set" == quarantine4 ]]; then
-                    printf 'add element inet %s %s { %s }\n' "$NFT_TABLE" "$set" "$addr"
-                elif ((secs > 0)); then
-                    printf 'add element inet %s %s { %s timeout %ss }\n' "$NFT_TABLE" "$set" "$addr" "$secs"
-                fi
-            done
-    done
+    local set addr secs
+    while read -r set addr secs; do
+        _fw_valid_elem "$set" "$addr" || continue
+        [[ "$secs" =~ ^[0-9]+$ ]] || continue
+        if [[ "$set" == quarantine4 ]]; then
+            printf 'add element inet %s %s { %s }\n' "$NFT_TABLE" "$set" "$addr"
+        elif ((secs > 0)); then
+            printf 'add element inet %s %s { %s timeout %ss }\n' "$NFT_TABLE" "$set" "$addr" "$secs"
+        fi
+    done < <(fw_list_dynamic)
+    fw_restore_commands
+}
+
+install_state_unit() {
+    local unit="$SYSTEMD_UNIT_DIR/ztvpn-firewall-state.service"
+    local self
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    mkdir -p "$SYSTEMD_UNIT_DIR"
+    atomic_write "$unit" 644 <<EOF
+[Unit]
+Description=Restore zero-trust-vpn blocklist and quarantine entries
+After=nftables.service
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=$self --restore-state
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        if systemctl daemon-reload && systemctl enable ztvpn-firewall-state.service >/dev/null 2>&1; then
+            info "ztvpn-firewall-state.service enabled (restores blocklist/quarantine at boot)"
+        else
+            warn "Could not enable ztvpn-firewall-state.service; enable it manually"
+        fi
+    else
+        warn "MANUAL: no systemd; run '$self --restore-state' after nftables loads at boot"
+    fi
 }
 
 persist() {
@@ -507,6 +533,8 @@ do_apply() {
     fi
 
     persist "$rendered"
+    install_state_unit
+    fw_save_state || warn "Could not save blocklist/quarantine state to $FW_STATE_FILE"
     rm -f "$rendered" "$confirm"
     post_apply_checks
     success "Firewall active: table inet $NFT_TABLE"
@@ -520,6 +548,7 @@ while (($#)); do
     case "$1" in
         --print) ACTION=print; shift ;;
         --apply) ACTION=apply; shift ;;
+        --restore-state) ACTION=restore; shift ;;
         --confirm-timeout)
             [[ $# -ge 2 && "$2" =~ ^[0-9]{1,4}$ ]] || die "--confirm-timeout needs a number of seconds"
             CONFIRM_TIMEOUT="$2"; shift 2 ;;
@@ -540,4 +569,11 @@ case "$ACTION" in
         render_ruleset
         ;;
     apply) do_apply "$CONFIRM_TIMEOUT" ;;
+    restore)
+        require_root
+        require_cmd nft jq
+        nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || die "table inet $NFT_TABLE is not loaded"
+        fw_restore_state || die "Could not restore saved set entries"
+        success "Restored saved blocklist/quarantine entries"
+        ;;
 esac

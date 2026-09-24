@@ -13,6 +13,7 @@ ztvpn_sandbox() {
     export ZTVPN_LOG_DIR="$t/log"
     export ZTVPN_BACKUP_DIR="$t/backup"
     export WG_DIR="$t/wireguard"
+    export SYSTEMD_UNIT_DIR="$t/systemd"
     export NO_COLOR=1
     mkdir -p "$ZTVPN_ETC" "$ZTVPN_HOME" "$ZTVPN_STATE_DIR" "$WG_DIR"
 }
