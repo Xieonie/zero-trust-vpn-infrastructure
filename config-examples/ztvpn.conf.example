@@ -1,0 +1,55 @@
+# Central configuration for all zero-trust-vpn scripts.
+# Install as /etc/zero-trust-vpn/ztvpn.conf (owner root, mode 600).
+#
+# Plain KEY=VALUE lines only. Nothing is executed or expanded: $(...) and
+# ${VAR} are taken literally. Environment variables override these values.
+# Defaults are in scripts/lib/common.sh.
+
+# --- Naming -------------------------------------------------------------
+DOMAIN=example.com
+AUTH_DOMAIN=auth.example.com
+# Public hostname or IP clients connect to
+VPN_ENDPOINT=vpn.example.com
+
+# --- Network ------------------------------------------------------------
+# The one and only tunnel subnet. Firewall, NAT and the Authelia "vpn"
+# network are derived from it.
+VPN_SUBNET=10.8.0.0/24
+VPN_SERVER_IP=10.8.0.1
+# Internal services reachable through the tunnel (reverse proxy etc.)
+SERVICES_SUBNET=10.0.1.0/24
+# Leave empty to auto-detect from the default route
+EXTERNAL_INTERFACE=
+# What clients route through the tunnel. Split tunnel by default.
+CLIENT_ALLOWED_IPS=10.8.0.0/24, 10.0.1.0/24
+# Resolver pushed to clients. Leave empty unless you run one in the tunnel.
+CLIENT_DNS=
+
+# --- WireGuard ----------------------------------------------------------
+WG_INTERFACE=wg0
+WG_PORT=51820
+
+# --- Firewall -----------------------------------------------------------
+# Comma separated IPs/CIDRs allowed to SSH in and never auto-blocked
+ADMIN_ALLOWLIST=
+SSH_PORT=22
+
+# --- PKI ----------------------------------------------------------------
+PKI_ORG=Zero Trust VPN
+PKI_COUNTRY=
+PKI_CERT_DAYS=365
+PKI_CA_DAYS=3650
+# ec:<curve> or rsa:<bits>
+PKI_KEY_ALG=ec:prime256v1
+PKI_CA_KEY_ALG=ec:secp384r1
+# Published CRL location embedded in issued certs (optional)
+PKI_CRL_URL=
+
+# --- Authelia -----------------------------------------------------------
+# file (users_database.yml) or ldap
+AUTHELIA_BACKEND=file
+DEFAULT_USER_GROUPS=users,vpn-users
+
+# --- Notifications (optional) -------------------------------------------
+NOTIFICATION_EMAIL=
+SLACK_WEBHOOK=
