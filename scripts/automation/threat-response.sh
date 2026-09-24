@@ -13,7 +13,6 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/threat-response.log}"
 INCIDENT_DIR="${INCIDENT_DIR:-$ZTVPN_STATE_DIR/incidents}"
-QUARANTINE_DIR="${QUARANTINE_DIR:-$ZTVPN_STATE_DIR/quarantine}"
 NFT_TABLE="${NFT_TABLE:-ztvpn}"
 # Also protect RFC1918 ranges from blocking (yes/no).
 THREAT_PROTECT_PRIVATE="${THREAT_PROTECT_PRIVATE:-no}"
@@ -380,14 +379,21 @@ cmd_release() {
     trap "rm -f '$pskfile'" EXIT
     awk -F' = ' '$1 == "PresharedKey" { print $2 }' "$qdir/peer.conf" >"$pskfile"
     [[ -s "$pskfile" ]] && psk="$pskfile"
-    wg_add_peer "$peer" "$pkey" "$pip" "$psk" || die "Could not restore peer $peer"
-    if [[ -d "$qdir/client" && ! -e "$WG_CLIENTS_DIR/$peer" ]]; then
+    # The active quarantine record reserves the IP; retire it first so the
+    # peer can take its own address back, and reinstate it on failure.
+    local released
+    released="$qdir.released-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "$qdir" "$released"
+    if ! wg_add_peer "$peer" "$pkey" "$pip" "$psk"; then
+        mv "$released" "$qdir"
+        die "Could not restore peer $peer"
+    fi
+    if [[ -d "$released/client" && ! -e "$WG_CLIENTS_DIR/$peer" ]]; then
         mkdir -p "$WG_CLIENTS_DIR"
-        cp -a "$qdir/client" "$WG_CLIENTS_DIR/$peer"
+        cp -a "$released/client" "$WG_CLIENTS_DIR/$peer"
     fi
     wg_apply || warn "Could not apply $WG_CONF to $WG_INTERFACE"
     nft delete element inet "$NFT_TABLE" quarantine4 "{ $pip }" || warn "$pip was not in quarantine4"
-    mv "$qdir" "$qdir.released-$(date -u +%Y%m%dT%H%M%SZ)"
     success "Released $peer ($pip). Its keys were in quarantine; re-enroll the device if compromise is confirmed."
 }
 

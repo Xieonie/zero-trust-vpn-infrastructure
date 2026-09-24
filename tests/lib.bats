@@ -239,3 +239,14 @@ CONF
     run docker run --rm "$AUTHELIA_IMAGE" authelia crypto hash validate --password $'Corr3ct-Horse\n' -- "$hash"
     [[ "$output" != *"password matches"* ]]
 }
+
+@test "IPs of quarantined peers are not handed out again" {
+    load_lib
+    ztvpn_fake_wg_server
+    mkdir -p "$QUARANTINE_DIR/mallory"
+    printf '{"ip":"10.8.0.2","public_key":"x"}\n' >"$QUARANTINE_DIR/mallory/meta.json"
+    [ "$(wg_next_free_ip)" = "10.8.0.3" ]
+    wg_ip_in_use 10.8.0.2
+    mv "$QUARANTINE_DIR/mallory" "$QUARANTINE_DIR/mallory.released-20260101T000000Z"
+    [ "$(wg_next_free_ip)" = "10.8.0.2" ]
+}

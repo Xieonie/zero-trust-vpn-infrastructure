@@ -38,8 +38,6 @@ EOF
 USERNAME="" EMAIL="" DISPLAY_NAME="" EXTRA_GROUPS="" DEVICE=""
 ADMIN=0 WANT_CERT=0 WANT_QR=0 WANT_VPN=1
 
-need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
-
 positional=()
 while (($#)); do
     case "$1" in
@@ -64,12 +62,6 @@ DISPLAY_NAME="${DISPLAY_NAME:-$USERNAME}"
 # --------------------------------------------------------------------------
 # Validation (nothing is touched before all of this passed)
 # --------------------------------------------------------------------------
-
-is_known_group() {
-    local g
-    while IFS= read -r g; do [[ "$g" == "$1" ]] && return 0; done < <(split_csv "$KNOWN_GROUPS")
-    return 1
-}
 
 # "--" separates user and device in peer names, so it may not appear in a username.
 validate_username "$USERNAME" && [[ "$USERNAME" != *--* ]] || die "Invalid username: $USERNAME"
@@ -118,26 +110,6 @@ fi
 # --------------------------------------------------------------------------
 # Helpers (candidates for the shared lib)
 # --------------------------------------------------------------------------
-
-audit() {
-    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
-        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
-            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
-}
-
-inventory_init() {
-    [[ -f "$DEVICE_INVENTORY" ]] && return 0
-    mkdir -p "$(dirname "$DEVICE_INVENTORY")"
-    printf '{"devices": []}\n' | atomic_write "$DEVICE_INVENTORY" 600
-}
-
-# inventory_edit <constant jq program> [jq --arg ...]
-inventory_edit() {
-    local prog="$1" out
-    shift
-    out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
-    printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
-}
 
 # --------------------------------------------------------------------------
 # Transaction

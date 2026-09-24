@@ -29,8 +29,6 @@ Inventory: $DEVICE_INVENTORY
 EOF
 }
 
-need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
-
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] || { usage >&2; exit 1; }
 shift
@@ -73,20 +71,6 @@ check_device() {
 # Inventory helpers (candidates for the shared lib)
 # --------------------------------------------------------------------------
 
-inventory_init() {
-    [[ -f "$DEVICE_INVENTORY" ]] && return 0
-    mkdir -p "$(dirname "$DEVICE_INVENTORY")"
-    printf '{"devices": []}\n' | atomic_write "$DEVICE_INVENTORY" 600
-}
-
-# inventory_edit <constant jq program> [jq --arg ...]
-inventory_edit() {
-    local prog="$1" out
-    shift
-    out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
-    printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
-}
-
 inventory_read() {
     if [[ -f "$DEVICE_INVENTORY" ]]; then
         jq -e '.devices | type == "array"' "$DEVICE_INVENTORY" >/dev/null ||
@@ -95,12 +79,6 @@ inventory_read() {
     else
         printf '{"devices": []}\n'
     fi
-}
-
-audit() {
-    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
-        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
-            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
 }
 
 # --------------------------------------------------------------------------

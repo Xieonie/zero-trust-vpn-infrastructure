@@ -551,9 +551,14 @@ setup_bob_family() {
     [ "$(sha256sum <"$AUTHELIA_DIR/configuration.yml")" = "$cfg" ]
     grep -q '^docker run --rm --network none -v .*authelia validate-config' "$CALLS"
 
+    touch "$ZTVPN_HOME/docker-compose.yml"
     run "$POLICY" add-rule --domain good.example.com --policy deny --restart
     [ "$status" -eq 0 ]
-    grep -qx 'docker restart authelia' "$CALLS"
+    grep -qx "docker compose -f $ZTVPN_HOME/docker-compose.yml restart authelia" "$CALLS"
+
+    AUTHELIA_CONTAINER=my-authelia run "$POLICY" add-rule --domain good2.example.com --policy deny --restart
+    [ "$status" -eq 0 ]
+    grep -qx 'docker restart my-authelia' "$CALLS"
 }
 
 @test "policy: real Authelia rejects an RE2-incompatible regex and the change is rolled back" {

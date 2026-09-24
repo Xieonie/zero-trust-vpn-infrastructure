@@ -45,9 +45,20 @@ wg_peer_by_ip() {
 }
 
 # Every tunnel IP in use, from any [Peer] or [Interface] Address line,
-# managed or not, so hand-added peers are never double-assigned.
+# managed or not, so hand-added peers are never double-assigned. IPs of
+# quarantined peers stay reserved: they are still in the nft quarantine
+# set, and handing them out would quarantine the new owner.
 _wg_used_ips() {
     printf '%s\n' "$VPN_SERVER_IP"
+    # Released/archived records are renamed "<peer>.<suffix>"; peer names
+    # never contain a dot, so only active quarantine records count.
+    local meta qname
+    for meta in "$QUARANTINE_DIR"/*/meta.json; do
+        [[ -f "$meta" ]] || continue
+        qname="$(basename "$(dirname "$meta")")"
+        [[ "$qname" == *.* ]] && continue
+        jq -r '.ip // empty' "$meta" 2>/dev/null
+    done
     [[ -f "$WG_CONF" ]] || return 0
     awk '
         /^[[:space:]]*(AllowedIPs|Address)[[:space:]]*=/ {

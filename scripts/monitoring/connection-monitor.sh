@@ -13,9 +13,6 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 ALERT_LOG="${ALERT_LOG:-$ZTVPN_LOG_DIR/alerts.log}"
 MONITOR_STATE="${MONITOR_STATE:-$ZTVPN_STATE_DIR/monitor/wg-sample.json}"
 # Authelia logs: a file, an explicit container, or the compose service.
-AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-}"
-AUTHELIA_SERVICE="${AUTHELIA_SERVICE:-authelia}"
-COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-$COMPOSE_DIR/docker-compose.yml}"
 AUTHELIA_LOG_FILE="${AUTHELIA_LOG_FILE:-}"
 # A handshake younger than this means the peer is connected.
 MONITOR_ACTIVE_SECS="${MONITOR_ACTIVE_SECS:-180}"

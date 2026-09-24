@@ -9,11 +9,9 @@ set -Eeuo pipefail
 # shellcheck source=scripts/lib/common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-AUTHELIA_CONFIG="${AUTHELIA_CONFIG:-$AUTHELIA_DIR/configuration.yml}"
 POLICY_BACKUP_DIR="${POLICY_BACKUP_DIR:-$ZTVPN_BACKUP_DIR/policy}"
 # auto: docker if usable, else structural checks only | docker | yq
 AUTHELIA_VALIDATE="${AUTHELIA_VALIDATE:-auto}"
-AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-authelia}"
 
 usage() {
     cat <<EOF
@@ -45,7 +43,7 @@ Maintenance:
   restore <backup>       Restore a backup (name or path under $POLICY_BACKUP_DIR)
 
 Global options:
-  --restart              Restart the Authelia container ($AUTHELIA_CONTAINER) after a
+  --restart              Restart Authelia (compose service $AUTHELIA_SERVICE) after a
                          successful config change (Authelia does not reload
                          configuration.yml by itself; the users DB is reloaded
                          when "watch: true" is set)
@@ -54,8 +52,6 @@ Global options:
 Known groups: $KNOWN_GROUPS
 EOF
 }
-
-need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
 
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] || { usage >&2; exit 1; }
@@ -94,12 +90,6 @@ require_yq || exit 1
 # Helpers
 # --------------------------------------------------------------------------
 
-is_known_group() {
-    local g
-    while IFS= read -r g; do [[ "$g" == "$1" ]] && return 0; done < <(split_csv "$KNOWN_GROUPS")
-    return 1
-}
-
 check_username() {
     validate_username "$1" && [[ "$1" != *--* ]] || die "Invalid username: $1"
 }
@@ -112,12 +102,6 @@ require_file_backend() {
 
 require_config() {
     [[ -f "$AUTHELIA_CONFIG" ]] || die "Authelia configuration $AUTHELIA_CONFIG not found"
-}
-
-audit() {
-    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
-        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
-            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
 }
 
 rules_json() {
@@ -322,10 +306,17 @@ finish_change() {
 
 maybe_restart() {
     if ((RESTART)); then
-        [[ "$AUTHELIA_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Invalid AUTHELIA_CONTAINER"
         require_cmd docker
-        docker restart "$AUTHELIA_CONTAINER" >/dev/null || die "Could not restart $AUTHELIA_CONTAINER"
-        success "Restarted $AUTHELIA_CONTAINER"
+        if [[ -n "$AUTHELIA_CONTAINER" ]]; then
+            [[ "$AUTHELIA_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Invalid AUTHELIA_CONTAINER"
+            docker restart "$AUTHELIA_CONTAINER" >/dev/null || die "Could not restart $AUTHELIA_CONTAINER"
+            success "Restarted $AUTHELIA_CONTAINER"
+        else
+            [[ -f "$COMPOSE_FILE_PATH" ]] || die "No compose file at $COMPOSE_FILE_PATH; set AUTHELIA_CONTAINER"
+            docker compose -f "$COMPOSE_FILE_PATH" restart "$AUTHELIA_SERVICE" >/dev/null ||
+                die "Could not restart compose service $AUTHELIA_SERVICE"
+            success "Restarted compose service $AUTHELIA_SERVICE"
+        fi
     else
         info "Restart Authelia to apply configuration changes (or pass --restart)"
     fi

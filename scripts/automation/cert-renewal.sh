@@ -20,9 +20,7 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/cert-renewal.log}"
 # TLS terminator that serves the server certificates: the compose service
 # in $COMPOSE_DIR, or an explicit container name if not run via compose.
-TLS_PROXY_SERVICE="${TLS_PROXY_SERVICE:-nginx}"
 TLS_PROXY_CONTAINER="${TLS_PROXY_CONTAINER:-}"
-COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-$COMPOSE_DIR/docker-compose.yml}"
 CERT_WARN_DAYS="${CERT_WARN_DAYS:-30}"
 CERT_CRITICAL_DAYS="${CERT_CRITICAL_DAYS:-7}"
 CERT_CA_WARN_DAYS="${CERT_CA_WARN_DAYS:-180}"

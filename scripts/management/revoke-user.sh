@@ -36,8 +36,6 @@ EOF
 
 REASON="cessationOfOperation" ACCOUNT_MODE="disable" USERNAME=""
 
-need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
-
 positional=()
 while (($#)); do
     case "$1" in
@@ -71,12 +69,6 @@ FAILURES=()
 MANUAL=()
 FOUND=0
 fail() { error "$*"; FAILURES+=("$*"); }
-
-audit() {
-    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
-        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
-            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
-}
 
 ztvpn_lock users
 ztvpn_lock wg

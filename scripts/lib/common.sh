@@ -164,9 +164,16 @@ KNOWN_GROUPS="${KNOWN_GROUPS:-admins,security,it-support,employees,remote-worker
 
 # Inventory and runtime state
 DEVICE_INVENTORY="${DEVICE_INVENTORY:-$ZTVPN_STATE_DIR/device-inventory.json}"
+QUARANTINE_DIR="${QUARANTINE_DIR:-$ZTVPN_STATE_DIR/quarantine}"
 
-# Compose deployment
+# Compose deployment. Containers are addressed by compose service name;
+# set AUTHELIA_CONTAINER only if Authelia runs outside this compose project.
 COMPOSE_DIR="${COMPOSE_DIR:-$ZTVPN_HOME}"
+COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-$COMPOSE_DIR/docker-compose.yml}"
+AUTHELIA_SERVICE="${AUTHELIA_SERVICE:-authelia}"
+AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-}"
+AUTHELIA_CONFIG="${AUTHELIA_CONFIG:-$AUTHELIA_DIR/configuration.yml}"
+TLS_PROXY_SERVICE="${TLS_PROXY_SERVICE:-nginx}"
 
 # Admin addresses that automated blocking must never touch
 ADMIN_ALLOWLIST="${ADMIN_ALLOWLIST:-}"
@@ -318,6 +325,39 @@ detect_external_interface() {
         return 0
     fi
     ip -o -4 route show to default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+
+# --------------------------------------------------------------------------
+# Shared script plumbing
+# --------------------------------------------------------------------------
+
+need_value() { [[ $# -ge 2 && -n "$2" ]] || die "Option $1 requires a value"; }
+
+is_known_group() {
+    local g
+    while IFS= read -r g; do [[ "$g" == "$1" ]] && return 0; done < <(split_csv "$KNOWN_GROUPS")
+    return 1
+}
+
+# Append-only audit trail of administrative actions. audit <action> <k=v ...>
+audit() {
+    (umask 027; mkdir -p "$ZTVPN_LOG_DIR" &&
+        printf '%s %s actor=%s %s\n' "$(date -Iseconds)" "$1" "${SUDO_USER:-$(id -un)}" "$2" \
+            >>"$ZTVPN_LOG_DIR/audit.log") || warn "Could not write audit log"
+}
+
+inventory_init() {
+    [[ -f "$DEVICE_INVENTORY" ]] && return 0
+    mkdir -p "$(dirname "$DEVICE_INVENTORY")"
+    printf '{"devices": []}\n' | atomic_write "$DEVICE_INVENTORY" 600
+}
+
+# inventory_edit <constant jq program> [jq --arg ...]
+inventory_edit() {
+    local prog="$1" out
+    shift
+    out="$(jq "$@" "$prog" "$DEVICE_INVENTORY")" || return 1
+    printf '%s\n' "$out" | atomic_write "$DEVICE_INVENTORY" 600
 }
 
 # shellcheck source=scripts/lib/wireguard.sh
