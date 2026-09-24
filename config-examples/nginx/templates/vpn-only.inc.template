@@ -1,0 +1,6 @@
+# Included by every HTTPS server block: only VPN clients may connect.
+# Docker's DNAT of the published ports keeps the client address, so
+# $remote_addr is the tunnel address. Authelia checks the same network again
+# (access_control "vpn" network); this is defence in depth, not a substitute.
+allow ${VPN_SUBNET};
+deny all;

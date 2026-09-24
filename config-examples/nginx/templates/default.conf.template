@@ -1,0 +1,55 @@
+# zero-trust-vpn reverse proxy: shared settings.
+#
+# Deployed to ${CONFIG_PATH}/nginx/templates and rendered by the nginx image
+# into /etc/nginx/conf.d at container start (envsubst). Only DOMAIN,
+# AUTH_DOMAIN and VPN_SUBNET are substituted (NGINX_ENVSUBST_FILTER in
+# docker-compose.yml); every other $name is an nginx variable.
+#
+# Replaces the image's default.conf (welcome page).
+
+server_tokens off;
+
+# Docker's embedded DNS. Upstreams are proxied through variables, so they
+# are resolved per request and a stopped optional service (the monitoring
+# profile) does not keep nginx from starting.
+resolver 127.0.0.11 valid=30s ipv6=off;
+
+# One server certificate for the portal and all applications. It comes from
+# scripts/setup/pki-setup.sh ($CERTS_PATH/server/<AUTH_DOMAIN>.crt); give it
+# the application names as SANs, e.g. PKI_SERVER_SANS=*.<DOMAIN> in ztvpn.conf.
+ssl_certificate     /etc/nginx/certs/${AUTH_DOMAIN}.crt;
+ssl_certificate_key /etc/nginx/certs/${AUTH_DOMAIN}.key;
+ssl_protocols       TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+ssl_session_timeout 1d;
+ssl_session_cache   shared:SSL:10m;
+ssl_session_tickets off;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Plain HTTP: health check for the container, everything else to HTTPS.
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location = /healthz {
+        access_log off;
+        allow 127.0.0.1;
+        deny all;
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# Unknown host names get no TLS handshake at all.
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}

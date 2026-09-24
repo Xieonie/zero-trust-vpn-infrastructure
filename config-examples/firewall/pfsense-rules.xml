@@ -1,175 +1,106 @@
-<?xml version="1.0"?>
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  zero-trust-vpn: example pfSense rules for a perimeter firewall IN FRONT of
+  the Linux VPN host. ILLUSTRATIVE ONLY.
+
+  What this is:
+    The relevant fragments of a pfSense config.xml (<aliases>, <nat>,
+    <filter>) showing the rules that match the host firewall contract
+    (scripts/setup/firewall-setup.sh): VPN clients (10.8.0.0/24) may reach
+    only the reverse proxy on the services subnet (10.0.1.0/24, tcp/443),
+    nothing else.
+
+  What this is NOT:
+    - Not a complete config.xml. Do NOT restore it with Diagnostics >
+      Backup & Restore: that replaces the whole configuration.
+    - Firewall > Rules has no import function.
+
+  How to use it:
+    1. Create the aliases under Firewall > Aliases (VPN_HOST = LAN/DMZ
+       address of the Linux WireGuard host, VPN_CLIENTS, SERVICES).
+    2. Create the port forward under Firewall > NAT > Port Forward.
+    3. Create the rules under Firewall > Rules on the interface the VPN
+       host is connected to (here "opt1"), in this order.
+    4. Add a static route 10.8.0.0/24 via VPN_HOST (System > Routing) so
+       replies reach the VPN clients without NAT, which keeps the client
+       address visible to nginx/Authelia.
+    Alternatively merge the elements into a config.xml backup by hand and
+    restore that; review every field (interfaces, trackers) first.
+
+  Placeholders: 192.168.10.10 (VPN host), opt1 (its interface).
+  Nothing here opens the Authelia port 9091: Authelia is reached only
+  through nginx on 443.
+-->
 <pfsense>
-  <version>2.7.0</version>
-  <lastchange></lastchange>
-  <system>
-    <optimization>normal</optimization>
-    <hostname>pfsense-zt</hostname>
-    <domain>local</domain>
-  </system>
-  
-  <!-- Zero Trust VPN Firewall Rules for pfSense -->
-  <filter>
-    <rule>
-      <id>1</id>
-      <tracker>1</tracker>
-      <type>pass</type>
-      <interface>wan</interface>
-      <ipprotocol>inet</ipprotocol>
-      <tag></tag>
-      <tagged></tagged>
-      <max></max>
-      <max-src-nodes></max-src-nodes>
-      <max-src-conn></max-src-conn>
-      <max-src-states></max-src-states>
-      <statetimeout></statetimeout>
-      <statetype>keep state</statetype>
-      <os></os>
-      <protocol>udp</protocol>
-      <source>
-        <any></any>
-      </source>
-      <destination>
-        <network>wanip</network>
-        <port>51820</port>
-      </destination>
-      <descr>Allow WireGuard VPN traffic on port 51820</descr>
-    </rule>
-    
-    <rule>
-      <id>2</id>
-      <tracker>2</tracker>
-      <type>pass</type>
-      <interface>wireguard</interface>
-      <ipprotocol>inet</ipprotocol>
-      <tag></tag>
-      <tagged></tagged>
-      <max></max>
-      <max-src-nodes></max-src-nodes>
-      <max-src-conn></max-src-conn>
-      <max-src-states></max-src-states>
-      <statetimeout></statetimeout>
-      <statetype>keep state</statetype>
-      <os></os>
-      <protocol>tcp</protocol>
-      <source>
-        <network>wireguard</network>
-      </source>
-      <destination>
-        <address>10.0.1.100</address>
-        <port>9091</port>
-      </destination>
-      <descr>Allow authenticated VPN users to access Authelia</descr>
-    </rule>
-    
-    <rule>
-      <id>3</id>
-      <tracker>3</tracker>
-      <type>block</type>
-      <interface>wireguard</interface>
-      <ipprotocol>inet</ipprotocol>
-      <tag></tag>
-      <tagged></tagged>
-      <max></max>
-      <max-src-nodes></max-src-nodes>
-      <max-src-conn></max-src-conn>
-      <max-src-states></max-src-states>
-      <statetimeout></statetimeout>
-      <statetype>keep state</statetype>
-      <os></os>
-      <protocol>any</protocol>
-      <source>
-        <network>wireguard</network>
-      </source>
-      <destination>
-        <network>lan</network>
-      </destination>
-      <descr>Block direct access to LAN from VPN (Zero Trust)</descr>
-    </rule>
-    
-    <rule>
-      <id>4</id>
-      <tracker>4</tracker>
-      <type>pass</type>
-      <interface>wireguard</interface>
-      <ipprotocol>inet</ipprotocol>
-      <tag></tag>
-      <tagged></tagged>
-      <max></max>
-      <max-src-nodes></max-src-nodes>
-      <max-src-conn></max-src-conn>
-      <max-src-states></max-src-states>
-      <statetimeout></statetimeout>
-      <statetype>keep state</statetype>
-      <os></os>
-      <protocol>tcp</protocol>
-      <source>
-        <network>wireguard</network>
-      </source>
-      <destination>
-        <address>10.0.1.0/24</address>
-        <port>443</port>
-      </destination>
-      <descr>Allow HTTPS to internal services via reverse proxy</descr>
-    </rule>
-    
-    <rule>
-      <id>5</id>
-      <tracker>5</tracker>
-      <type>pass</type>
-      <interface>wireguard</interface>
-      <ipprotocol>inet</ipprotocol>
-      <tag></tag>
-      <tagged></tagged>
-      <max></max>
-      <max-src-nodes></max-src-nodes>
-      <max-src-conn></max-src-conn>
-      <max-src-states></max-src-states>
-      <statetimeout></statetimeout>
-      <statetype>keep state</statetype>
-      <os></os>
-      <protocol>udp</protocol>
-      <source>
-        <network>wireguard</network>
-      </source>
-      <destination>
-        <address>1.1.1.1</address>
-        <port>53</port>
-      </destination>
-      <descr>Allow DNS queries to Cloudflare</descr>
-    </rule>
-  </filter>
-  
-  <!-- NAT Rules -->
+  <aliases>
+    <alias>
+      <name>VPN_HOST</name>
+      <type>host</type>
+      <address>192.168.10.10</address>
+      <descr>Linux host running WireGuard (wg0) and the container stack</descr>
+    </alias>
+    <alias>
+      <name>VPN_CLIENTS</name>
+      <type>network</type>
+      <address>10.8.0.0/24</address>
+      <descr>WireGuard tunnel subnet (VPN_SUBNET)</descr>
+    </alias>
+    <alias>
+      <name>SERVICES</name>
+      <type>network</type>
+      <address>10.0.1.0/24</address>
+      <descr>Services subnet (SERVICES_SUBNET), reverse proxy only</descr>
+    </alias>
+  </aliases>
+
   <nat>
     <rule>
-      <id>1</id>
-      <tracker>1</tracker>
       <interface>wan</interface>
       <ipprotocol>inet</ipprotocol>
       <protocol>udp</protocol>
       <source>
-        <any></any>
+        <any/>
       </source>
       <destination>
         <network>wanip</network>
         <port>51820</port>
       </destination>
-      <target>10.0.2.1</target>
+      <target>VPN_HOST</target>
       <local-port>51820</local-port>
-      <descr>NAT WireGuard traffic to VPN server</descr>
+      <associated-rule-id>pass</associated-rule-id>
+      <descr>WireGuard to the VPN host</descr>
     </rule>
   </nat>
-  
-  <!-- Interfaces -->
-  <interfaces>
-    <wireguard>
-      <enable></enable>
-      <if>wg0</if>
-      <descr>WireGuard VPN</descr>
-      <ipaddr>10.0.2.1</ipaddr>
-      <subnet>24</subnet>
-      <gateway></gateway>
-    </wireguard>
-  </interfaces>
+
+  <filter>
+    <rule>
+      <type>pass</type>
+      <interface>opt1</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>tcp</protocol>
+      <statetype>keep state</statetype>
+      <source>
+        <address>VPN_CLIENTS</address>
+      </source>
+      <destination>
+        <address>SERVICES</address>
+        <port>443</port>
+      </destination>
+      <descr>VPN clients to the reverse proxy (Authelia forward auth) only</descr>
+    </rule>
+    <rule>
+      <type>block</type>
+      <interface>opt1</interface>
+      <ipprotocol>inet46</ipprotocol>
+      <protocol>any</protocol>
+      <log/>
+      <source>
+        <address>VPN_CLIENTS</address>
+      </source>
+      <destination>
+        <any/>
+      </destination>
+      <descr>Everything else from VPN clients (no LAN, no internet unless FULL_TUNNEL)</descr>
+    </rule>
+  </filter>
 </pfsense>
