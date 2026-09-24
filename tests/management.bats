@@ -9,6 +9,7 @@ ADD="$BATS_TEST_DIRNAME/../scripts/management/add-user.sh"
 REVOKE="$BATS_TEST_DIRNAME/../scripts/management/revoke-user.sh"
 DEVICE="$BATS_TEST_DIRNAME/../scripts/management/device-enrollment.sh"
 POLICY="$BATS_TEST_DIRNAME/../scripts/management/policy-update.sh"
+ACCOUNT="$BATS_TEST_DIRNAME/../scripts/management/user-account.sh"
 
 setup() {
     ztvpn_sandbox
@@ -623,4 +624,48 @@ setup_bob_family() {
     [ "$(sha256sum <"$AUTHELIA_DIR/configuration.yml")" = "$cfg" ]
     run "$POLICY" restore /etc
     [ "$status" -ne 0 ]
+}
+
+@test "user-account: reset-password writes a new verifiable hash, never prints it" {
+    run --separate-stderr "$ADD" carol carol@example.com --no-vpn
+    [ "$status" -eq 0 ]
+    old="$(authelia_user_field carol password)"
+
+    run --separate-stderr "$ACCOUNT" reset-password carol
+    [ "$status" -eq 0 ]
+    file="$(kv onboarding)"
+    [ -f "$file" ]
+    [ "$(stat -c %a "$file")" = "600" ]
+    pw="$(sed -n 's/^Password:  //p' "$file")"
+    [ "${#pw}" -eq 24 ]
+    [[ "$output" != *"$pw"* && "$stderr" != *"$pw"* ]]
+    new="$(authelia_user_field carol password)"
+    [ "$new" != "$old" ]
+    salt="$(cut -d'$' -f5 <<<"$new")"
+    salt="$(python3 -c 'import base64,sys; s=sys.argv[1]; print(base64.b64decode(s + "=" * (-len(s) % 4)).decode())' "$salt")"
+    [ "$(printf '%s' "$pw" | argon2 "$salt" -id -t 3 -k 65536 -p 4 -l 32 -e)" = "$new" ]
+    grep -q 'reset-password actor=.* user=carol' "$ZTVPN_LOG_DIR/audit.log"
+}
+
+@test "user-account: disable, enable, show; unknown and invalid users rejected" {
+    run --separate-stderr "$ADD" dave dave@example.com --no-vpn
+    [ "$status" -eq 0 ]
+    run --separate-stderr "$ACCOUNT" disable dave
+    [ "$status" -eq 0 ]
+    [ "$(authelia_user_field dave disabled)" = "true" ]
+    run --separate-stderr "$ACCOUNT" enable dave
+    [ "$status" -eq 0 ]
+    [ "$(authelia_user_field dave disabled)" = "false" ]
+    run --separate-stderr "$ACCOUNT" show dave
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .email <<<"$output")" = "dave@example.com" ]
+    [[ "$output" != *argon2* ]]
+
+    run "$ACCOUNT" enable nobody
+    [ "$status" -ne 0 ]
+    run "$ACCOUNT" reset-password 'x"; rm -rf /'
+    [ "$status" -ne 0 ]
+    AUTHELIA_BACKEND=ldap run "$ACCOUNT" enable dave
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"directory"* ]]
 }

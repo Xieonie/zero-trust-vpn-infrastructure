@@ -167,8 +167,10 @@ Portal:   https://$AUTH_DOMAIN
 User:     $ADMIN_USER
 Password: $password
 
-Log in, register a second factor (TOTP or WebAuthn) and change the
-password. Then delete this file.
+Log in and register a second factor (TOTP or WebAuthn). The portal cannot
+change passwords (the scripts own the users database); for a new one run
+scripts/management/user-account.sh reset-password $ADMIN_USER
+Then delete this file.
 EOF
         unset password
         success "Created Authelia admin $ADMIN_USER (groups: $ADMIN_GROUPS)"

@@ -236,7 +236,7 @@ if [[ -n "$PASSWORD" ]]; then
         printf 'Login:              https://%s\n' "$AUTH_DOMAIN"
         printf 'Username:           %s\n' "$USERNAME"
         printf 'One-time password:  %s\n' "$PASSWORD"
-        printf '\nChange the password and enrol a second factor at first login.\n'
+        printf '\nEnrol a second factor (TOTP or WebAuthn) at first login. Password resets:\nscripts/management/user-account.sh reset-password %s\n' "$USERNAME"
         [[ -n "$CLIENT_CONF" ]] && printf 'WireGuard config:   %s\n' "$CLIENT_CONF"
         [[ -n "$QR_FILE" ]] && printf 'WireGuard QR code:  %s\n' "$QR_FILE"
         [[ -n "$CERT" ]] && printf 'Client certificate: %s (key: %s)\n' "$CERT" "$PKI_CLIENTS_DIR/$CERT_CN.key"
