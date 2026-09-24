@@ -38,6 +38,3 @@ docker-compose*.yml text eol=lf
 # Ansible files
 *.ansible text eol=lf
 *.playbook text eol=lf
-
-# Ensure shell scripts are executable
-*.sh filter=lfs diff=lfs merge=lfs -text

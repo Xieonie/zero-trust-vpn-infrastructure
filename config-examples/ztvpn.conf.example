@@ -1,0 +1,97 @@
+# Central configuration for all zero-trust-vpn scripts.
+# Install as /etc/zero-trust-vpn/ztvpn.conf (owner root, mode 600).
+#
+# Plain KEY=VALUE lines only. Nothing is executed or expanded: $(...) and
+# ${VAR} are taken literally. Environment variables override these values.
+# Defaults are in scripts/lib/common.sh.
+
+# --- Naming -------------------------------------------------------------
+DOMAIN=example.com
+AUTH_DOMAIN=auth.example.com
+# Public hostname or IP clients connect to
+VPN_ENDPOINT=vpn.example.com
+
+# --- Network ------------------------------------------------------------
+# The one and only tunnel subnet. Firewall, NAT and the Authelia "vpn"
+# network are derived from it.
+VPN_SUBNET=10.8.0.0/24
+VPN_SERVER_IP=10.8.0.1
+# Internal services reachable through the tunnel (reverse proxy etc.)
+SERVICES_SUBNET=10.0.1.0/24
+# This host's address in SERVICES_SUBNET; nginx publishes 80/443 only there.
+# Empty = first local IPv4 address inside SERVICES_SUBNET.
+PROXY_BIND_ADDR=
+# Leave empty to auto-detect from the default route
+EXTERNAL_INTERFACE=
+# What clients route through the tunnel. Split tunnel by default.
+CLIENT_ALLOWED_IPS=10.8.0.0/24, 10.0.1.0/24
+# Resolver pushed to clients. Leave empty unless you run one in the tunnel.
+CLIENT_DNS=
+
+# --- WireGuard ----------------------------------------------------------
+WG_INTERFACE=wg0
+WG_PORT=51820
+
+# --- Firewall (scripts/setup/firewall-setup.sh) -------------------------
+# Comma separated IPs/CIDRs allowed to SSH in and never auto-blocked.
+# Empty = SSH open to everyone (rate limited), with a warning.
+ADMIN_ALLOWLIST=
+SSH_PORT=22
+# TCP ports open on the host from anywhere. Only for services running natively
+# on the host; the Docker nginx is bound to PROXY_BIND_ADDR instead.
+PUBLIC_TCP_PORTS=
+# Ports VPN clients may reach in SERVICES_SUBNET (the Authelia-protected proxy)
+SERVICES_PORTS=443
+# Ports VPN clients may reach on VPN_SERVER_IP itself (e.g. 53 if you run DNS)
+WG_INPUT_PORTS=
+# yes = clients may use the tunnel for internet egress (set CLIENT_ALLOWED_IPS too)
+FULL_TUNNEL=no
+# yes = masquerade VPN traffic towards SERVICES_SUBNET. Hides client IPs, which
+# breaks Authelia's "vpn" network rules; only for routed service networks.
+SERVICES_NAT=no
+
+# --- PKI ----------------------------------------------------------------
+PKI_ORG=Zero Trust VPN
+PKI_COUNTRY=
+PKI_CERT_DAYS=365
+PKI_CA_DAYS=3650
+# ec:<curve> or rsa:<bits>
+PKI_KEY_ALG=ec:prime256v1
+PKI_CA_KEY_ALG=ec:secp384r1
+# Published CRL location embedded in issued certs (optional)
+PKI_CRL_URL=
+# Extra SANs for the reverse proxy certificate. The nginx templates serve
+# grafana/prometheus/alerts subdomains, so a wildcard covers them.
+PKI_SERVER_SANS=*.example.com
+# Server certs with fewer days left are re-issued by pki-setup/cert-renewal
+PKI_RENEW_DAYS=30
+# cert-renewal.sh renew regenerates the CRL when fewer days than this are
+# left until its nextUpdate (CRLs are valid for 30 days)
+PKI_CRL_RENEW_DAYS=7
+# yes = .p12 bundles use 3DES/SHA1 for clients that cannot import the
+# OpenSSL 3 default (AES-256) bundles, e.g. older macOS/iOS/Android
+PKI_P12_COMPAT=no
+
+# --- Mutual TLS at the reverse proxy ------------------------------------
+# yes = every HTTPS request to nginx (portal and applications) needs a client
+# certificate issued by this CA that is not revoked, on top of the Authelia
+# login. Users must import the .p12 bundle created by add-user.sh --cert or
+# device-enrollment.sh enroll --cert; without it they get a 403 page.
+# Needs a daily "scripts/automation/cert-renewal.sh renew" (cron): nginx
+# rejects every client once the CRL's nextUpdate has passed.
+# After changing it, re-run scripts/setup/initial-setup.sh.
+MTLS=no
+
+# --- Authelia -----------------------------------------------------------
+# file (users_database.yml) or ldap
+AUTHELIA_BACKEND=file
+DEFAULT_USER_GROUPS=users,vpn-users
+# ldap backend only: executable called as "<hook> <user> disable|delete" by
+# revoke-user.sh. Without it, disabling the directory account is manual.
+LDAP_DISABLE_HOOK=
+
+# --- Notifications (optional) -------------------------------------------
+ADMIN_EMAIL=
+TZ=UTC
+NOTIFICATION_EMAIL=
+SLACK_WEBHOOK=

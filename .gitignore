@@ -1,0 +1,19 @@
+# Generated secrets and key material must never be committed
+.env
+*.env
+!.env.example
+*.key
+*.pem
+*.p12
+*.csr
+*.crt
+*.crl
+*.srl
+*.psk
+secrets/
+certificates/**
+!certificates/**/
+!certificates/**/.gitkeep
+*.conf.bak
+*-qr.png
+backups/
