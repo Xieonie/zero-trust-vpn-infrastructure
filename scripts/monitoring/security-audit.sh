@@ -1,653 +1,570 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Technical security audit of a zero-trust-vpn host.
+#
+# Every check inspects real state and records pass, fail (with severity
+# and the offending items) or skip (component not present / not readable).
+# Nothing is reported as passing without having been checked.
+#
+# Check IDs are stable; compliance-check.sh maps them to controls.
 
-# Zero Trust VPN Infrastructure - Security Audit Script
-# This script performs comprehensive security audits of the Zero Trust VPN infrastructure
-# including certificate validation, access control verification, and security compliance checks
+set -Eeuo pipefail
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
+NFT_TABLE="${NFT_TABLE:-ztvpn}"
+AUTHELIA_CONFIG="${AUTHELIA_CONFIG:-$AUTHELIA_DIR/configuration.yml}"
+# Host ports that may be published on all interfaces.
+AUDIT_PUBLIC_PORTS="${AUDIT_PUBLIC_PORTS:-80,443,$WG_PORT}"
+ZTVPN_PROC_DIR="${ZTVPN_PROC_DIR:-/proc}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-NC='\033[0m' # No Color
-
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
-CONFIG_DIR="$PROJECT_ROOT/config-examples"
-CERT_DIR="$PROJECT_ROOT/certificates"
-LOG_DIR="/var/log/zero-trust-vpn"
-AUDIT_REPORT_DIR="$PROJECT_ROOT/audit-reports"
-
-# Audit configuration
-CERT_EXPIRY_WARNING_DAYS=30
-MAX_FAILED_LOGINS=5
-AUDIT_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-REPORT_FILE="$AUDIT_REPORT_DIR/security_audit_$AUDIT_TIMESTAMP.txt"
-
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
-}
-
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
-}
-
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-}
-
-info() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
-}
-
-critical() {
-    echo -e "${PURPLE}[$(date +'%Y-%m-%d %H:%M:%S')] CRITICAL: $1${NC}"
-}
-
-# Display usage information
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") [--json] [--fail-on SEVERITY] [--verbose]
 
-Zero Trust VPN Security Audit Script
+  --json            Print results as JSON on stdout
+  --fail-on SEV     Exit 1 if any finding has at least this severity:
+                    info, low, medium, high (default), critical, or none
+  --verbose         Also list passed checks in text output
+  -h, --help        Show this help
 
-OPTIONS:
-    --full                  Perform full comprehensive audit
-    --quick                 Perform quick security check
-    --certificates          Audit certificate status only
-    --access-control        Audit access control policies only
-    --network               Audit network configuration only
-    --compliance            Check compliance with security standards
-    --report-only           Generate report without console output
-    --output FILE           Specify custom output file
-    -v, --verbose           Enable verbose output
-    -h, --help              Show this help message
-
-AUDIT CATEGORIES:
-    - Certificate Management
-    - Access Control Policies
-    - Network Security Configuration
-    - User and Device Management
-    - Log Analysis and Monitoring
-    - Compliance Verification
-
-EXAMPLES:
-    $0 --full                           # Complete security audit
-    $0 --quick                          # Quick security check
-    $0 --certificates --verbose         # Detailed certificate audit
-    $0 --compliance --output report.txt # Compliance check with custom output
-
+Exit codes: 0 no findings at/above --fail-on, 1 findings, 2 usage/runtime error.
 EOF
 }
 
-# Parse command line arguments
-parse_args() {
-    AUDIT_TYPE="full"
-    VERBOSE=false
-    REPORT_ONLY=false
-    CUSTOM_OUTPUT=""
+fatal() { error "$*"; exit 2; }
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --full)
-                AUDIT_TYPE="full"
-                shift
-                ;;
-            --quick)
-                AUDIT_TYPE="quick"
-                shift
-                ;;
-            --certificates)
-                AUDIT_TYPE="certificates"
-                shift
-                ;;
-            --access-control)
-                AUDIT_TYPE="access-control"
-                shift
-                ;;
-            --network)
-                AUDIT_TYPE="network"
-                shift
-                ;;
-            --compliance)
-                AUDIT_TYPE="compliance"
-                shift
-                ;;
-            --report-only)
-                REPORT_ONLY=true
-                shift
-                ;;
-            --output)
-                CUSTOM_OUTPUT="$2"
-                shift 2
-                ;;
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                error "Unknown option: $1"
-                exit 1
-                ;;
+sev_rank() {
+    case "$1" in
+        info) echo 0 ;; low) echo 1 ;; medium) echo 2 ;; high) echo 3 ;; critical) echo 4 ;;
+        none) echo 99 ;; *) return 1 ;;
+    esac
+}
+
+RESULTS=""
+
+# record <id> <pass|fail|skip> <severity> <title> [item ...]
+record() {
+    local id="$1" status="$2" sev="$3" title="$4"
+    shift 4
+    local items='[]'
+    if (($#)); then
+        items="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
+    fi
+    jq -nc --arg id "$id" --arg status "$status" --arg sev "$sev" --arg title "$title" --argjson items "$items" \
+        '{id: $id, status: $status, severity: $sev, title: $title, items: $items}' >>"$RESULTS"
+}
+
+# pass/fail helper: result <id> <severity> <title> [items...] -> fail if items given
+result() {
+    local id="$1" sev="$2" title="$3"
+    shift 3
+    if (($#)); then
+        record "$id" fail "$sev" "$title" "$@"
+    else
+        record "$id" pass "$sev" "$title"
+    fi
+}
+
+perm_of() { stat -c %a "$1"; }
+# True if the file grants anything beyond the bits in <allowed> (octal).
+perm_exceeds() {
+    local p
+    p="$(perm_of "$1")"
+    (((8#$p & ~8#$2 & 8#7777) != 0))
+}
+
+# --------------------------------------------------------------------------
+# File permissions
+# --------------------------------------------------------------------------
+
+audit_files() {
+    local -a bad
+    local f
+
+    for f in "$WG_SERVER_KEY:FILE-WG-KEY:WireGuard server private key is 0600 and root-owned" \
+        "$WG_CONF:FILE-WG-CONF:WireGuard server config (contains the private key) is 0600" \
+        "$PKI_CA_PASSFILE:FILE-CA-PASS:CA key passphrase file is 0600" \
+        "$AUTHELIA_USERS_DB:FILE-AUTHELIA-USERS:Authelia users database (password hashes) is 0600"; do
+        local path="${f%%:*}" rest="${f#*:}"
+        local id="${rest%%:*}" title="${rest#*:}"
+        if [[ ! -e "$path" ]]; then
+            record "$id" skip high "$title" "$path not found"
+            continue
+        fi
+        bad=()
+        perm_exceeds "$path" 600 && bad+=("$path mode $(perm_of "$path")")
+        [[ "$(stat -c %u "$path")" == 0 || "$(stat -c %u "$path")" == "$(id -u)" ]] || bad+=("$path owned by uid $(stat -c %u "$path")")
+        result "$id" high "$title" "${bad[@]}"
+    done
+
+    if [[ -d "$WG_CLIENTS_DIR" ]]; then
+        bad=()
+        while IFS= read -r f; do
+            bad+=("$f mode $(perm_of "$f")")
+        done < <(find "$WG_CLIENTS_DIR" -mindepth 1 \( -type f -perm /077 \) -o \( -type d -perm /077 \) 2>/dev/null)
+        result FILE-WG-CLIENTS high "Client key material under $WG_CLIENTS_DIR is not group/world accessible" "${bad[@]}"
+        local n
+        n="$(find "$WG_CLIENTS_DIR" -name private.key -type f 2>/dev/null | wc -l)"
+        if ((n > 0)); then
+            record FILE-WG-CLIENT-KEYS-ON-SERVER fail info "Client private keys are not kept on the server" \
+                "$n client private key(s) in $WG_CLIENTS_DIR; deliver and delete them"
+        else
+            record FILE-WG-CLIENT-KEYS-ON-SERVER pass info "Client private keys are not kept on the server"
+        fi
+    else
+        record FILE-WG-CLIENTS skip high "Client key material under $WG_CLIENTS_DIR is not group/world accessible" "$WG_CLIENTS_DIR not found"
+        record FILE-WG-CLIENT-KEYS-ON-SERVER skip info "Client private keys are not kept on the server" "$WG_CLIENTS_DIR not found"
+    fi
+
+    if [[ -f "$PKI_CA_KEY" ]]; then
+        if grep -q -- '-----BEGIN ENCRYPTED PRIVATE KEY-----' "$PKI_CA_KEY"; then
+            record PKI-CA-KEY-ENCRYPTED pass critical "CA private key is encrypted"
+        else
+            record PKI-CA-KEY-ENCRYPTED fail critical "CA private key is encrypted" "$PKI_CA_KEY is not encrypted"
+        fi
+        bad=()
+        perm_exceeds "$PKI_CA_KEY" 400 && bad+=("$PKI_CA_KEY mode $(perm_of "$PKI_CA_KEY")")
+        perm_exceeds "$(dirname "$PKI_CA_KEY")" 700 && bad+=("$(dirname "$PKI_CA_KEY") mode $(perm_of "$(dirname "$PKI_CA_KEY")")")
+        result FILE-CA-KEY high "CA private key is 0400 in a 0700 directory" "${bad[@]}"
+    else
+        record PKI-CA-KEY-ENCRYPTED skip critical "CA private key is encrypted" "$PKI_CA_KEY not found"
+        record FILE-CA-KEY skip high "CA private key is 0400 in a 0700 directory" "$PKI_CA_KEY not found"
+    fi
+
+    bad=()
+    for f in "$PKI_SERVER_DIR"/*.key "$PKI_CLIENTS_DIR"/*.key; do
+        [[ -f "$f" ]] || continue
+        perm_exceeds "$f" 600 && bad+=("$f mode $(perm_of "$f")")
+    done
+    result FILE-PKI-KEYS high "Certificate private keys are 0600" "${bad[@]}"
+
+    if [[ -d "$AUTHELIA_SECRETS_DIR" ]]; then
+        bad=()
+        perm_exceeds "$AUTHELIA_SECRETS_DIR" 700 && bad+=("$AUTHELIA_SECRETS_DIR mode $(perm_of "$AUTHELIA_SECRETS_DIR")")
+        while IFS= read -r f; do
+            bad+=("$f mode $(perm_of "$f")")
+        done < <(find "$AUTHELIA_SECRETS_DIR" -mindepth 1 -perm /077 2>/dev/null)
+        result FILE-AUTHELIA-SECRETS high "Authelia secret files are not group/world accessible" "${bad[@]}"
+    else
+        record FILE-AUTHELIA-SECRETS skip high "Authelia secret files are not group/world accessible" "$AUTHELIA_SECRETS_DIR not found"
+    fi
+
+    if [[ -f "$ZTVPN_CONFIG" ]]; then
+        bad=()
+        perm_exceeds "$ZTVPN_CONFIG" 755 && bad+=("$ZTVPN_CONFIG mode $(perm_of "$ZTVPN_CONFIG")")
+        result FILE-CONFIG high "ztvpn.conf is not group/world writable" "${bad[@]}"
+    else
+        record FILE-CONFIG skip high "ztvpn.conf is not group/world writable" "$ZTVPN_CONFIG not found"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# PKI
+# --------------------------------------------------------------------------
+
+db_status() {
+    local serial
+    serial="$(openssl x509 -in "$1" -noout -serial 2>/dev/null)" || return 0
+    serial="${serial#serial=}"
+    [[ -f "$PKI_CA_DIR/index.txt" ]] || return 0
+    awk -F'\t' -v s="$serial" 'toupper($4) == toupper(s) { print $1; exit }' "$PKI_CA_DIR/index.txt"
+}
+
+max_sev() {
+    if (($(sev_rank "$1") >= $(sev_rank "$2"))); then echo "$1"; else echo "$2"; fi
+}
+
+audit_pki() {
+    if [[ ! -f "$PKI_CA_CERT" ]]; then
+        local id
+        for id in PKI-CA-EXPIRY PKI-SERVER-EXPIRY PKI-CLIENT-EXPIRY PKI-CHAIN PKI-CRL; do
+            record "$id" skip high "PKI check" "$PKI_CA_CERT not found"
+        done
+        return 0
+    fi
+    local days sev
+    days="$(pki_days_left "$PKI_CA_CERT")" || days=-1
+    if ((days < 0)); then
+        record PKI-CA-EXPIRY fail critical "CA certificate is valid for more than 180 days" "CA expired"
+    elif ((days <= 90)); then
+        record PKI-CA-EXPIRY fail high "CA certificate is valid for more than 180 days" "CA expires in $days days"
+    elif ((days <= 180)); then
+        record PKI-CA-EXPIRY fail medium "CA certificate is valid for more than 180 days" "CA expires in $days days"
+    else
+        record PKI-CA-EXPIRY pass medium "CA certificate is valid for more than 180 days"
+    fi
+
+    local f name st
+    local -a srv_items=() chain_items=() cli_items=()
+    local srv_sev=medium
+    for f in "$PKI_SERVER_DIR"/*.crt; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f" .crt)"
+        st="$(db_status "$f")"
+        days="$(pki_days_left "$f")" || { srv_items+=("$name: unreadable"); srv_sev=high; continue; }
+        if ((days < 0)); then
+            srv_items+=("$name expired"); srv_sev="$(max_sev "$srv_sev" critical)"
+        elif ((days <= 7)); then
+            srv_items+=("$name expires in $days days"); srv_sev="$(max_sev "$srv_sev" high)"
+        elif ((days <= 30)); then
+            srv_items+=("$name expires in $days days")
+        fi
+        if ! pki_verify "$f"; then
+            chain_items+=("$name does not verify against the CA and CRL${st:+ (CA db status $st)}")
+        fi
+    done
+    result PKI-SERVER-EXPIRY "$srv_sev" "Server certificates are valid for more than 30 days" "${srv_items[@]}"
+    result PKI-CHAIN high "Server certificates chain to the CA and are not revoked" "${chain_items[@]}"
+
+    for f in "$PKI_CLIENTS_DIR"/*.crt; do
+        [[ -f "$f" ]] || continue
+        [[ "$(db_status "$f")" == R ]] && continue
+        days="$(pki_days_left "$f")" || continue
+        ((days < 0)) && cli_items+=("$(basename "$f" .crt) expired but not revoked")
+    done
+    result PKI-CLIENT-EXPIRY low "No expired, unrevoked client certificates are lying around" "${cli_items[@]}"
+
+    if [[ ! -f "$PKI_CRL" ]]; then
+        record PKI-CRL fail high "CRL exists, is signed by the CA and is current" "$PKI_CRL not found"
+        return 0
+    fi
+    local next next_epoch now
+    sev=medium
+    local -a crl_items=()
+    if ! openssl crl -in "$PKI_CRL" -CAfile "$PKI_CA_CERT" -noout >/dev/null 2>&1; then
+        crl_items+=("CRL signature does not verify against the CA"); sev=high
+    fi
+    next="$(openssl crl -in "$PKI_CRL" -noout -nextupdate 2>/dev/null)" || next=""
+    next="${next#nextUpdate=}"
+    now="$(date +%s)"
+    if next_epoch="$(date -d "$next" +%s 2>/dev/null)" && [[ -n "$next" ]]; then
+        if ((next_epoch < now)); then
+            crl_items+=("CRL expired at $next; clients checking it will fail"); sev=high
+        elif ((next_epoch - now < 7 * 86400)); then
+            crl_items+=("CRL nextUpdate $next is less than 7 days away; run pki_gen_crl")
+        fi
+    else
+        crl_items+=("CRL has no readable nextUpdate"); sev=high
+    fi
+    result PKI-CRL "$sev" "CRL exists, is signed by the CA and is current" "${crl_items[@]}"
+}
+
+# --------------------------------------------------------------------------
+# WireGuard
+# --------------------------------------------------------------------------
+
+audit_wireguard() {
+    if [[ ! -f "$WG_CONF" ]]; then
+        local id
+        for id in WG-HOOKS WG-UNMANAGED WG-ALLOWEDIPS WG-PSK; do
+            record "$id" skip high "WireGuard check" "$WG_CONF not found"
+        done
+        return 0
+    fi
+    local -a items=()
+    local line sev=low
+    while IFS= read -r line; do
+        items+=("$line")
+        [[ "$line" =~ ip6?tables ]] && sev=high
+    done < <(grep -E '^[[:space:]]*(PreUp|PostUp|PreDown|PostDown)[[:space:]]*=' "$WG_CONF" || true)
+    result WG-HOOKS "$sev" "wg config has no Pre/PostUp hooks (firewall lives in nftables)" "${items[@]}"
+
+    items=()
+    local n
+    n="$(awk '/^# BEGIN PEER / { m = 1 } /^# END PEER / { m = 0 } /^[[:space:]]*\[Peer\]/ && !m { c++ } END { print c + 0 }' "$WG_CONF")"
+    ((n > 0)) && items+=("$n [Peer] section(s) without BEGIN/END PEER markers (not managed by the tooling)")
+    result WG-UNMANAGED medium "All peers are managed (have BEGIN/END PEER markers)" "${items[@]}"
+
+    items=()
+    local -A used=()
+    local entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if [[ "$entry" != */32 ]] || ! ip_in_cidr "${entry%/32}" "$VPN_SUBNET"; then
+            items+=("AllowedIPs $entry is not a single address in $VPN_SUBNET")
+        elif [[ -n "${used[$entry]:-}" ]]; then
+            items+=("AllowedIPs $entry assigned to more than one peer")
+        fi
+        used["$entry"]=1
+    done < <(awk '
+        /^[[:space:]]*\[/ { peer = ($0 ~ /\[Peer\]/) }
+        peer && /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            n = split($0, a, /[[:space:]]*,[[:space:]]*/)
+            for (i = 1; i <= n; i++) print a[i]
+        }' "$WG_CONF")
+    result WG-ALLOWEDIPS high "Every peer is limited to one /32 inside VPN_SUBNET" "${items[@]}"
+
+    items=()
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && items+=("$n has no PresharedKey")
+    done < <(awk '
+        /^# BEGIN PEER / { name = substr($0, 14); psk = 0; next }
+        /^# END PEER / { if (name != "" && !psk) print name; name = ""; next }
+        name != "" && /^[[:space:]]*PresharedKey[[:space:]]*=/ { psk = 1 }' "$WG_CONF")
+    result WG-PSK low "Managed peers use a preshared key" "${items[@]}"
+}
+
+# --------------------------------------------------------------------------
+# Firewall
+# --------------------------------------------------------------------------
+
+# Forwarding is safe if the forward hook defaults to drop, or if traffic
+# from and to the WireGuard interface is sent (jump/goto) to chains whose
+# last rule is an unconditional drop. The latter is the shipped design,
+# because a drop policy on the forward hook would break Docker. Prints
+# "ok" or the reason.
+FORWARD_JQ='
+    (.nftables | map(select(.chain) | .chain)) as $chains
+    | (.nftables | map(select(.rule) | .rule)) as $rules
+    | ($chains | map(select(.hook == "forward"))) as $fwd
+    | def target($dir):
+        [$rules[] | select(.chain as $c | $fwd | any(.name == $c))
+         | select(any(.expr[]; (.match.left.meta.key? == $dir) and (.match.right? == $ifn) and (.match.op? == "==")))
+         | .expr[] | (.jump.target? // .goto.target? // empty)];
+      def ends_in_drop($t): ([$rules[] | select(.chain == $t)] | last | .expr) == [{"drop": null}];
+    if ($fwd | length) == 0 then "no forward base chain"
+    elif all($fwd[]; .policy == "drop") then "ok"
+    else
+      [("iifname", "oifname") as $d | target($d) as $t
+       | if ($t | length) == 0 then "policy accept and no \($d) \($ifn) jump to a default-drop chain"
+         elif all($t[]; ends_in_drop(.)) then empty
+         else "\($d) \($ifn) chain \($t | join(",")) does not end in drop" end]
+      | if length == 0 then "ok" else join("; ") end
+    end'
+
+audit_firewall() {
+    local ruleset fwd6=0
+    [[ "$(cat "$ZTVPN_PROC_DIR/sys/net/ipv6/conf/all/forwarding" 2>/dev/null || echo 0)" == 1 ]] && fwd6=1
+
+    if ! command -v nft >/dev/null 2>&1; then
+        local id
+        for id in FW-TABLE FW-POLICY FW-SETS FW-IPV6; do record "$id" skip critical "Firewall check" "nft not installed"; done
+        return 0
+    fi
+    if ! ruleset="$(nft -j list table inet "$NFT_TABLE" 2>/dev/null)" || ! jq -e '.nftables' >/dev/null 2>&1 <<<"$ruleset"; then
+        record FW-TABLE fail critical "nftables table inet $NFT_TABLE is loaded" "table inet $NFT_TABLE not found"
+        record FW-POLICY skip critical "Input and forward base chains default to drop" "no table"
+        record FW-SETS skip medium "Blocklist and quarantine sets exist" "no table"
+        if ((fwd6)); then
+            record FW-IPV6 fail high "IPv6 forwarding is covered by the firewall" "IPv6 forwarding is enabled and no inet $NFT_TABLE table filters it"
+        else
+            record FW-IPV6 pass high "IPv6 forwarding is covered by the firewall"
+        fi
+        return 0
+    fi
+    record FW-TABLE pass critical "nftables table inet $NFT_TABLE is loaded"
+
+    local -a items=()
+    local pol
+    pol="$(jq -r '[.nftables[] | select(.chain) | .chain | select(.hook == "input")] | if length == 0 then "missing" else (map(.policy // "accept") | if all(. == "drop") then "drop" else "policy is not drop" end) end' <<<"$ruleset")"
+    [[ "$pol" == drop ]] || items+=("input hook: $pol")
+    pol="$(jq -r --arg ifn "$WG_INTERFACE" "$FORWARD_JQ" <<<"$ruleset")"
+    [[ "$pol" == ok ]] || items+=("forward hook: $pol")
+    result FW-POLICY critical "Input and forward base chains default to drop" "${items[@]}"
+
+    items=()
+    local set want_timeout
+    for set in blocklist4:1 blocklist6:1 quarantine4:0; do
+        want_timeout="${set#*:}" set="${set%:*}"
+        if ! jq -e --arg s "$set" '.nftables[] | select(.set) | .set | select(.name == $s)' >/dev/null <<<"$ruleset"; then
+            items+=("set $set missing")
+        elif ((want_timeout)) && ! jq -e --arg s "$set" '[.nftables[] | select(.set) | .set | select(.name == $s) | .flags // [] | if type == "array" then .[] else . end] | any(. == "timeout")' >/dev/null <<<"$ruleset"; then
+            items+=("set $set lacks the timeout flag (blocks would never expire)")
+        fi
+    done
+    result FW-SETS medium "Blocklist and quarantine sets exist" "${items[@]}"
+
+    items=()
+    if ((fwd6)); then
+        pol="$(jq -r --arg ifn "$WG_INTERFACE" "$FORWARD_JQ" <<<"$ruleset")"
+        [[ "$pol" == ok ]] || items+=("IPv6 forwarding is enabled and inet $NFT_TABLE does not default-drop forwarded $WG_INTERFACE traffic ($pol)")
+    fi
+    result FW-IPV6 high "IPv6 forwarding is covered by the firewall" "${items[@]}"
+}
+
+# --------------------------------------------------------------------------
+# Docker published ports
+# --------------------------------------------------------------------------
+
+audit_docker() {
+    local out
+    if ! command -v docker >/dev/null 2>&1 || ! out="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null)"; then
+        record NET-DOCKER-PORTS skip high "Containers publish only 80/443/WireGuard on all interfaces" "docker not available"
+        return 0
+    fi
+    local -a items=()
+    local name ports p host addr port
+    while IFS=$'\t' read -r name ports; do
+        [[ -n "$ports" ]] || continue
+        local -a maps
+        IFS=',' read -ra maps <<<"$ports"
+        for p in "${maps[@]}"; do
+            p="${p# }"
+            [[ "$p" == *"->"* ]] || continue
+            host="${p%%->*}"
+            addr="${host%:*}" port="${host##*:}"
+            case "$addr" in
+                0.0.0.0 | "[::]" | :: | "") ;;
+                *) continue ;;
+            esac
+            if [[ "$port" =~ ^[0-9]+$ ]] && ip_port_allowed "$port"; then
+                continue
+            fi
+            items+=("$name publishes ${addr:-*}:$port (${p##*->})")
+        done
+    done <<<"$out"
+    local -a uniq=()
+    if ((${#items[@]})); then mapfile -t uniq < <(printf '%s\n' "${items[@]}" | LC_ALL=C sort -u); fi
+    result NET-DOCKER-PORTS high "Containers publish only 80/443/WireGuard on all interfaces" "${uniq[@]}"
+}
+
+ip_port_allowed() {
+    local a
+    while IFS= read -r a; do
+        [[ "$a" == "$1" ]] && return 0
+    done < <(split_csv "$AUDIT_PUBLIC_PORTS")
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Authelia
+# --------------------------------------------------------------------------
+
+audit_authelia() {
+    local cfg
+    if [[ ! -f "$AUTHELIA_CONFIG" ]] || ! command -v yq >/dev/null 2>&1 || ! cfg="$(yq -o=json '.' "$AUTHELIA_CONFIG" 2>/dev/null)"; then
+        local id
+        for id in AUTH-DEFAULT-DENY AUTH-BYPASS AUTH-INLINE-SECRETS; do
+            record "$id" skip high "Authelia configuration check" "$AUTHELIA_CONFIG not found or not parseable"
+        done
+    else
+        local pol
+        pol="$(jq -r '.access_control.default_policy // "unset"' <<<"$cfg")"
+        if [[ "$pol" == deny ]]; then
+            record AUTH-DEFAULT-DENY pass high "Authelia access_control.default_policy is deny"
+        else
+            record AUTH-DEFAULT-DENY fail high "Authelia access_control.default_policy is deny" "default_policy is $pol"
+        fi
+
+        local -a items=()
+        mapfile -t items < <(jq -r '
+            (.access_control.rules // []) | to_entries[]
+            | select(.value.policy == "bypass")
+            | select(((.value.networks // []) | length) > 0 or ([.value.domain] | flatten | any(. == "*")))
+            | "rule #\(.key) bypasses authentication for \([.value.domain] | flatten | join(",")) from networks \((.value.networks // []) | join(","))"' <<<"$cfg")
+        result AUTH-BYPASS high "No bypass rules based on network location or for all domains" "${items[@]}"
+
+        items=()
+        mapfile -t items < <(jq -r '
+            [["jwt_secret"], ["identity_validation","reset_password","jwt_secret"], ["session","secret"],
+             ["storage","encryption_key"], ["storage","postgres","password"], ["session","redis","password"],
+             ["authentication_backend","ldap","password"], ["notifier","smtp","password"]][] as $p
+            | select((getpath($p) // "") | type == "string" and length > 0)
+            | ($p | join(".")) + " is set inline; use a secret file (AUTHELIA_*_FILE)"' <<<"$cfg")
+        result AUTH-INLINE-SECRETS medium "Authelia secrets are not stored inline in configuration.yml" "${items[@]}"
+    fi
+
+    # Identity checks against the users database and the WireGuard peers.
+    if [[ "$AUTHELIA_BACKEND" != file ]]; then
+        record ID-ORPHAN-PEERS skip high "Every VPN peer belongs to an enabled account" "AUTHELIA_BACKEND=$AUTHELIA_BACKEND; run automation/user-sync.sh"
+        record ID-IDLE-ACCOUNTS skip low "Enabled accounts have a VPN device" "AUTHELIA_BACKEND=$AUTHELIA_BACKEND"
+        record ID-UNKNOWN-GROUPS skip low "Users only have known groups" "AUTHELIA_BACKEND=$AUTHELIA_BACKEND"
+        return 0
+    fi
+    local users
+    if [[ ! -f "$AUTHELIA_USERS_DB" ]] || ! command -v yq >/dev/null 2>&1 || ! users="$(yq -o=json '.users // {}' "$AUTHELIA_USERS_DB" 2>/dev/null)"; then
+        record ID-ORPHAN-PEERS skip high "Every VPN peer belongs to an enabled account" "$AUTHELIA_USERS_DB not found or not parseable"
+        record ID-IDLE-ACCOUNTS skip low "Enabled accounts have a VPN device" "$AUTHELIA_USERS_DB not found"
+        record ID-UNKNOWN-GROUPS skip low "Users only have known groups" "$AUTHELIA_USERS_DB not found"
+        return 0
+    fi
+    local -A owners=()
+    local -a orphans=() idle=() badgroups=()
+    local n _ip _k u state
+    while read -r n _ip _k; do
+        [[ -n "$n" ]] || continue
+        u="${n%%--*}"
+        owners["$u"]=1
+        state="$(jq -r --arg u "$u" 'if has($u) then (if .[$u].disabled == true then "disabled" else "enabled" end) else "missing" end' <<<"$users")"
+        [[ "$state" == enabled ]] || orphans+=("peer $n: account $u is $state")
+    done < <(wg_list_peers)
+    result ID-ORPHAN-PEERS high "Every VPN peer belongs to an enabled account" "${orphans[@]}"
+
+    while IFS= read -r u; do
+        [[ -n "$u" && -z "${owners[$u]:-}" ]] && idle+=("$u is enabled but has no VPN peer")
+    done < <(jq -r 'to_entries[] | select(.value.disabled != true) | .key' <<<"$users")
+    result ID-IDLE-ACCOUNTS low "Enabled accounts have a VPN device" "${idle[@]}"
+
+    local known_json
+    known_json="$(split_csv "$KNOWN_GROUPS" | jq -R . | jq -sc .)"
+    mapfile -t badgroups < <(jq -r --argjson known "$known_json" '
+        to_entries[] | .key as $u | (.value.groups // [])[] | select(. as $g | $known | any(. == $g) | not)
+        | "\($u) has unknown group \(.)"' <<<"$users")
+    result ID-UNKNOWN-GROUPS low "Users only have known groups" "${badgroups[@]}"
+}
+
+# --------------------------------------------------------------------------
+
+main() {
+    local json=0 fail_on=high verbose=0
+    while (($#)); do
+        case "$1" in
+            --json) json=1; shift ;;
+            --fail-on) fail_on="${2:-}"; shift 2 || fatal "--fail-on needs a value" ;;
+            --verbose) verbose=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) usage >&2; fatal "Unknown option: $1" ;;
         esac
     done
+    local threshold
+    threshold="$(sev_rank "$fail_on")" || fatal "Invalid --fail-on: $fail_on"
+    [[ "$NFT_TABLE" =~ ^[a-z][a-z0-9_]*$ ]] || fatal "Invalid NFT_TABLE"
+    require_cmd jq openssl
 
-    # Set custom output file if specified
-    if [[ -n "$CUSTOM_OUTPUT" ]]; then
-        REPORT_FILE="$CUSTOM_OUTPUT"
+    local work
+    work="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+    RESULTS="$work/results.ndjson"
+    : >"$RESULTS"
+
+    audit_files
+    audit_pki
+    audit_wireguard
+    audit_firewall
+    audit_docker
+    audit_authelia
+
+    local report
+    report="$(jq -s --arg at "$(date -u +%FT%TZ)" --arg host "${HOSTNAME:-$(uname -n)}" --arg fail_on "$fail_on" '
+        {generated: $at, host: $host, fail_on: $fail_on,
+         summary: {checks: length,
+                   passed: map(select(.status == "pass")) | length,
+                   failed: map(select(.status == "fail")) | length,
+                   skipped: map(select(.status == "skip")) | length,
+                   by_severity: (reduce (.[] | select(.status == "fail")) as $r
+                        ({critical: 0, high: 0, medium: 0, low: 0, info: 0}; .[$r.severity] += 1))},
+         checks: .}' "$RESULTS")"
+
+    if ((json)); then
+        printf '%s\n' "$report"
+    else
+        jq -r --argjson verbose "$verbose" '
+            (.checks[] | select(.status != "pass" or $verbose == 1)
+             | "\(if .status == "fail" then "[" + (.severity | ascii_upcase) + "]" elif .status == "skip" then "[SKIP]" else "[PASS]" end) \(.id): \(.title)"
+               + (if (.items | length) > 0 then "\n" + (.items | map("    - " + .) | join("\n")) else "" end)),
+            "",
+            "Checks: \(.summary.checks)  passed: \(.summary.passed)  failed: \(.summary.failed)  skipped: \(.summary.skipped)",
+            "Findings by severity: critical \(.summary.by_severity.critical), high \(.summary.by_severity.high), medium \(.summary.by_severity.medium), low \(.summary.by_severity.low), info \(.summary.by_severity.info)"' <<<"$report"
     fi
+
+    local worst
+    worst="$(jq -r '[.checks[] | select(.status == "fail") | {"info":0,"low":1,"medium":2,"high":3,"critical":4}[.severity]] | max // -1' <<<"$report")"
+    if ((worst >= threshold)); then
+        exit 1
+    fi
+    exit 0
 }
 
-# Initialize audit environment
-init_audit() {
-    log "Initializing security audit..."
-
-    # Create necessary directories
-    mkdir -p "$AUDIT_REPORT_DIR" "$LOG_DIR"
-
-    # Initialize report file
-    cat > "$REPORT_FILE" << EOF
-Zero Trust VPN Infrastructure Security Audit Report
-===================================================
-
-Audit Date: $(date)
-Audit Type: $AUDIT_TYPE
-Generated by: $(whoami)@$(hostname)
-
-EOF
-
-    # Check prerequisites
-    local required_commands=("openssl" "wg" "systemctl" "ss" "iptables")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            error "Required command not found: $cmd"
-            exit 1
-        fi
-    done
-}
-
-# Write to report file
-write_report() {
-    echo "$1" >> "$REPORT_FILE"
-    if [[ "$REPORT_ONLY" != "true" ]]; then
-        echo "$1"
-    fi
-}
-
-# Audit certificate management
-audit_certificates() {
-    write_report ""
-    write_report "Certificate Management Audit"
-    write_report "============================"
-
-    local cert_issues=0
-
-    # Check CA certificate
-    if [[ -f "$CERT_DIR/ca/ca.crt" ]]; then
-        local ca_expiry=$(openssl x509 -in "$CERT_DIR/ca/ca.crt" -noout -enddate | cut -d= -f2)
-        local ca_days_left=$(( ($(date -d "$ca_expiry" +%s) - $(date +%s)) / 86400 ))
-        
-        if [[ $ca_days_left -lt $CERT_EXPIRY_WARNING_DAYS ]]; then
-            write_report "⚠️  CA Certificate expires in $ca_days_left days ($ca_expiry)"
-            ((cert_issues++))
-        else
-            write_report "✅ CA Certificate valid for $ca_days_left days"
-        fi
-    else
-        write_report "❌ CA Certificate not found"
-        ((cert_issues++))
-    fi
-
-    # Check server certificate
-    if [[ -f "$CERT_DIR/server/server.crt" ]]; then
-        local server_expiry=$(openssl x509 -in "$CERT_DIR/server/server.crt" -noout -enddate | cut -d= -f2)
-        local server_days_left=$(( ($(date -d "$server_expiry" +%s) - $(date +%s)) / 86400 ))
-        
-        if [[ $server_days_left -lt $CERT_EXPIRY_WARNING_DAYS ]]; then
-            write_report "⚠️  Server Certificate expires in $server_days_left days ($server_expiry)"
-            ((cert_issues++))
-        else
-            write_report "✅ Server Certificate valid for $server_days_left days"
-        fi
-    else
-        write_report "❌ Server Certificate not found"
-        ((cert_issues++))
-    fi
-
-    # Check client certificates
-    local client_cert_count=0
-    local expiring_client_certs=0
-
-    if [[ -d "$CERT_DIR/clients" ]]; then
-        for client_dir in "$CERT_DIR/clients"/*; do
-            if [[ -d "$client_dir" && -f "$client_dir/client.crt" ]]; then
-                ((client_cert_count++))
-                local client_name=$(basename "$client_dir")
-                local client_expiry=$(openssl x509 -in "$client_dir/client.crt" -noout -enddate | cut -d= -f2)
-                local client_days_left=$(( ($(date -d "$client_expiry" +%s) - $(date +%s)) / 86400 ))
-                
-                if [[ $client_days_left -lt $CERT_EXPIRY_WARNING_DAYS ]]; then
-                    write_report "⚠️  Client Certificate '$client_name' expires in $client_days_left days"
-                    ((expiring_client_certs++))
-                elif [[ "$VERBOSE" == "true" ]]; then
-                    write_report "✅ Client Certificate '$client_name' valid for $client_days_left days"
-                fi
-            fi
-        done
-    fi
-
-    write_report ""
-    write_report "Certificate Summary:"
-    write_report "- Total client certificates: $client_cert_count"
-    write_report "- Expiring client certificates: $expiring_client_certs"
-    write_report "- Total certificate issues: $cert_issues"
-
-    return $cert_issues
-}
-
-# Audit access control policies
-audit_access_control() {
-    write_report ""
-    write_report "Access Control Policy Audit"
-    write_report "==========================="
-
-    local policy_issues=0
-
-    # Check Authelia configuration
-    local authelia_config="$CONFIG_DIR/authelia/configuration.yml"
-    if [[ -f "$authelia_config" ]]; then
-        write_report "✅ Authelia configuration file found"
-        
-        # Check for secure session configuration
-        if grep -q "secure: true" "$authelia_config"; then
-            write_report "✅ Secure session cookies enabled"
-        else
-            write_report "⚠️  Secure session cookies not explicitly enabled"
-            ((policy_issues++))
-        fi
-
-        # Check for proper domain configuration
-        if grep -q "domain:" "$authelia_config"; then
-            write_report "✅ Domain configuration present"
-        else
-            write_report "❌ Domain configuration missing"
-            ((policy_issues++))
-        fi
-    else
-        write_report "❌ Authelia configuration file not found"
-        ((policy_issues++))
-    fi
-
-    # Check access control rules
-    local access_control_file="$CONFIG_DIR/authelia/access-control.yml"
-    if [[ -f "$access_control_file" ]]; then
-        write_report "✅ Access control rules file found"
-        
-        # Count rules
-        local rule_count=$(yq eval '.access_control.rules | length' "$access_control_file" 2>/dev/null || echo "0")
-        write_report "📋 Number of access control rules: $rule_count"
-        
-        if [[ $rule_count -eq 0 ]]; then
-            write_report "⚠️  No access control rules defined"
-            ((policy_issues++))
-        fi
-    else
-        write_report "❌ Access control rules file not found"
-        ((policy_issues++))
-    fi
-
-    # Check user database
-    local users_db="$CONFIG_DIR/authelia/users_database.yml"
-    if [[ -f "$users_db" ]]; then
-        local user_count=$(yq eval '.users | length' "$users_db" 2>/dev/null || echo "0")
-        write_report "👥 Number of users in database: $user_count"
-        
-        # Check for default passwords
-        if grep -q "password.*password" "$users_db" 2>/dev/null; then
-            write_report "❌ Default passwords detected in user database"
-            ((policy_issues++))
-        else
-            write_report "✅ No obvious default passwords found"
-        fi
-    else
-        write_report "❌ User database file not found"
-        ((policy_issues++))
-    fi
-
-    write_report ""
-    write_report "Access Control Summary:"
-    write_report "- Total policy issues: $policy_issues"
-
-    return $policy_issues
-}
-
-# Audit network security configuration
-audit_network() {
-    write_report ""
-    write_report "Network Security Configuration Audit"
-    write_report "===================================="
-
-    local network_issues=0
-
-    # Check WireGuard service status
-    if systemctl is-active --quiet wg-quick@wg0; then
-        write_report "✅ WireGuard service is running"
-        
-        # Check WireGuard interface
-        if wg show wg0 &>/dev/null; then
-            local peer_count=$(wg show wg0 peers | wc -l)
-            write_report "🔗 Active WireGuard peers: $peer_count"
-        else
-            write_report "❌ WireGuard interface not accessible"
-            ((network_issues++))
-        fi
-    else
-        write_report "❌ WireGuard service is not running"
-        ((network_issues++))
-    fi
-
-    # Check firewall status
-    if systemctl is-active --quiet ufw; then
-        write_report "✅ UFW firewall is active"
-    elif systemctl is-active --quiet iptables; then
-        write_report "✅ iptables service is active"
-    else
-        write_report "⚠️  No active firewall service detected"
-        ((network_issues++))
-    fi
-
-    # Check for open ports
-    local open_ports=$(ss -tuln | grep LISTEN | wc -l)
-    write_report "🔌 Total listening ports: $open_ports"
-
-    # Check for WireGuard port
-    if ss -uln | grep -q ":51820"; then
-        write_report "✅ WireGuard port (51820) is listening"
-    else
-        write_report "❌ WireGuard port (51820) not listening"
-        ((network_issues++))
-    fi
-
-    # Check IP forwarding
-    if [[ $(cat /proc/sys/net/ipv4/ip_forward) == "1" ]]; then
-        write_report "✅ IP forwarding is enabled"
-    else
-        write_report "❌ IP forwarding is disabled"
-        ((network_issues++))
-    fi
-
-    # Check for suspicious network connections
-    local suspicious_connections=$(ss -tuln | grep -E ":(22|80|443|8080|8443)" | wc -l)
-    write_report "🌐 Common service ports listening: $suspicious_connections"
-
-    write_report ""
-    write_report "Network Security Summary:"
-    write_report "- Total network issues: $network_issues"
-
-    return $network_issues
-}
-
-# Audit user and device management
-audit_user_device_management() {
-    write_report ""
-    write_report "User and Device Management Audit"
-    write_report "================================"
-
-    local management_issues=0
-
-    # Check device inventory
-    local device_inventory="$PROJECT_ROOT/device-inventory.json"
-    if [[ -f "$device_inventory" ]]; then
-        local device_count=$(jq '.devices | length' "$device_inventory" 2>/dev/null || echo "0")
-        write_report "📱 Total enrolled devices: $device_count"
-        
-        # Check for inactive devices
-        local inactive_devices=$(jq -r '.devices[] | select(.status != "active") | .id' "$device_inventory" 2>/dev/null | wc -l)
-        write_report "💤 Inactive devices: $inactive_devices"
-        
-        if [[ $inactive_devices -gt 0 ]]; then
-            write_report "⚠️  Inactive devices found - consider cleanup"
-        fi
-    else
-        write_report "❌ Device inventory file not found"
-        ((management_issues++))
-    fi
-
-    # Check for orphaned certificates
-    local cert_count=0
-    local inventory_devices=0
-    
-    if [[ -d "$CERT_DIR/clients" ]]; then
-        cert_count=$(find "$CERT_DIR/clients" -name "client.crt" | wc -l)
-    fi
-    
-    if [[ -f "$device_inventory" ]]; then
-        inventory_devices=$(jq '.devices | length' "$device_inventory" 2>/dev/null || echo "0")
-    fi
-    
-    if [[ $cert_count -ne $inventory_devices ]]; then
-        write_report "⚠️  Certificate count ($cert_count) doesn't match inventory ($inventory_devices)"
-        ((management_issues++))
-    else
-        write_report "✅ Certificate count matches device inventory"
-    fi
-
-    write_report ""
-    write_report "User and Device Management Summary:"
-    write_report "- Total management issues: $management_issues"
-
-    return $management_issues
-}
-
-# Audit log analysis and monitoring
-audit_logs() {
-    write_report ""
-    write_report "Log Analysis and Monitoring Audit"
-    write_report "================================="
-
-    local log_issues=0
-
-    # Check for authentication logs
-    if [[ -f "/var/log/auth.log" ]]; then
-        write_report "✅ Authentication log file found"
-        
-        # Check for recent failed login attempts
-        local failed_logins=$(grep "Failed password" /var/log/auth.log | grep "$(date +%Y-%m-%d)" | wc -l)
-        write_report "🔐 Failed login attempts today: $failed_logins"
-        
-        if [[ $failed_logins -gt $MAX_FAILED_LOGINS ]]; then
-            write_report "⚠️  High number of failed login attempts detected"
-            ((log_issues++))
-        fi
-    else
-        write_report "❌ Authentication log file not found"
-        ((log_issues++))
-    fi
-
-    # Check WireGuard logs
-    if journalctl -u wg-quick@wg0 --since "24 hours ago" --quiet; then
-        write_report "✅ WireGuard logs accessible"
-        
-        local wg_errors=$(journalctl -u wg-quick@wg0 --since "24 hours ago" --grep "error\|failed" | wc -l)
-        write_report "🔧 WireGuard errors in last 24h: $wg_errors"
-        
-        if [[ $wg_errors -gt 0 ]]; then
-            write_report "⚠️  WireGuard errors detected in recent logs"
-            ((log_issues++))
-        fi
-    else
-        write_report "❌ Cannot access WireGuard logs"
-        ((log_issues++))
-    fi
-
-    # Check Authelia logs if available
-    if journalctl -u authelia --since "24 hours ago" --quiet 2>/dev/null; then
-        write_report "✅ Authelia logs accessible"
-        
-        local auth_failures=$(journalctl -u authelia --since "24 hours ago" --grep "authentication.*failed" | wc -l)
-        write_report "🚫 Authentication failures in last 24h: $auth_failures"
-        
-        if [[ $auth_failures -gt $MAX_FAILED_LOGINS ]]; then
-            write_report "⚠️  High number of authentication failures"
-            ((log_issues++))
-        fi
-    else
-        write_report "ℹ️  Authelia logs not accessible (service may not be running)"
-    fi
-
-    write_report ""
-    write_report "Log Analysis Summary:"
-    write_report "- Total log issues: $log_issues"
-
-    return $log_issues
-}
-
-# Check compliance with security standards
-audit_compliance() {
-    write_report ""
-    write_report "Security Compliance Audit"
-    write_report "========================="
-
-    local compliance_issues=0
-
-    # Check encryption standards
-    write_report "Encryption Standards:"
-    
-    # Check certificate key sizes
-    if [[ -f "$CERT_DIR/ca/ca.crt" ]]; then
-        local ca_key_size=$(openssl x509 -in "$CERT_DIR/ca/ca.crt" -noout -text | grep "Public-Key:" | grep -o "[0-9]*" | head -1)
-        if [[ $ca_key_size -ge 2048 ]]; then
-            write_report "✅ CA certificate uses adequate key size ($ca_key_size bits)"
-        else
-            write_report "❌ CA certificate uses inadequate key size ($ca_key_size bits)"
-            ((compliance_issues++))
-        fi
-    fi
-
-    # Check WireGuard configuration security
-    local wg_config="/etc/wireguard/wg0.conf"
-    if [[ -f "$wg_config" ]]; then
-        if grep -q "PresharedKey" "$wg_config"; then
-            write_report "✅ WireGuard uses pre-shared keys for additional security"
-        else
-            write_report "⚠️  WireGuard not using pre-shared keys"
-            ((compliance_issues++))
-        fi
-    fi
-
-    # Check password policies
-    write_report ""
-    write_report "Password Policy Compliance:"
-    
-    # This is a simplified check - in practice, you'd check actual password policies
-    write_report "ℹ️  Manual review required for password policy compliance"
-
-    # Check access control principles
-    write_report ""
-    write_report "Zero Trust Principles:"
-    write_report "✅ Network segmentation implemented (WireGuard)"
-    write_report "✅ Multi-factor authentication available (Authelia)"
-    write_report "✅ Certificate-based device authentication"
-    write_report "✅ Encrypted communications (WireGuard + TLS)"
-
-    write_report ""
-    write_report "Compliance Summary:"
-    write_report "- Total compliance issues: $compliance_issues"
-
-    return $compliance_issues
-}
-
-# Generate audit summary
-generate_summary() {
-    local total_issues=$1
-
-    write_report ""
-    write_report "AUDIT SUMMARY"
-    write_report "============="
-    write_report ""
-    write_report "Audit completed at: $(date)"
-    write_report "Total security issues found: $total_issues"
-    write_report ""
-
-    if [[ $total_issues -eq 0 ]]; then
-        write_report "🎉 No critical security issues detected!"
-        write_report "✅ Zero Trust VPN infrastructure appears to be secure"
-    elif [[ $total_issues -le 5 ]]; then
-        write_report "⚠️  Minor security issues detected"
-        write_report "📝 Review and address the issues listed above"
-    else
-        write_report "❌ Multiple security issues detected"
-        write_report "🚨 Immediate attention required to address security concerns"
-    fi
-
-    write_report ""
-    write_report "Next recommended actions:"
-    write_report "1. Review all flagged issues in detail"
-    write_report "2. Update certificates nearing expiration"
-    write_report "3. Review and update access control policies"
-    write_report "4. Monitor logs for suspicious activity"
-    write_report "5. Schedule regular security audits"
-    write_report ""
-    write_report "Report saved to: $REPORT_FILE"
-}
-
-# Main audit execution
-main() {
-    init_audit
-
-    log "Starting $AUDIT_TYPE security audit..."
-
-    local total_issues=0
-
-    case "$AUDIT_TYPE" in
-        "full")
-            audit_certificates && total_issues=$((total_issues + $?))
-            audit_access_control && total_issues=$((total_issues + $?))
-            audit_network && total_issues=$((total_issues + $?))
-            audit_user_device_management && total_issues=$((total_issues + $?))
-            audit_logs && total_issues=$((total_issues + $?))
-            audit_compliance && total_issues=$((total_issues + $?))
-            ;;
-        "quick")
-            audit_certificates && total_issues=$((total_issues + $?))
-            audit_network && total_issues=$((total_issues + $?))
-            ;;
-        "certificates")
-            audit_certificates && total_issues=$((total_issues + $?))
-            ;;
-        "access-control")
-            audit_access_control && total_issues=$((total_issues + $?))
-            ;;
-        "network")
-            audit_network && total_issues=$((total_issues + $?))
-            ;;
-        "compliance")
-            audit_compliance && total_issues=$((total_issues + $?))
-            ;;
-    esac
-
-    generate_summary $total_issues
-
-    if [[ "$REPORT_ONLY" != "true" ]]; then
-        log "Security audit completed. Report saved to: $REPORT_FILE"
-        
-        if [[ $total_issues -gt 0 ]]; then
-            warn "Security issues detected. Review the report for details."
-            exit 1
-        else
-            log "No critical security issues found."
-        fi
-    fi
-}
-
-# Parse arguments and run main function
-parse_args "$@"
-main
+main "$@"

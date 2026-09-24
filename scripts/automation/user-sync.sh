@@ -1,554 +1,380 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Reconciles VPN access with the directory (LDAP / Active Directory).
+#
+# With AUTHELIA_BACKEND=ldap Authelia already authenticates against the
+# directory, so there is nothing to copy. What can drift is VPN access:
+# WireGuard peers (and, with the file backend, Authelia file users) that
+# belong to people who have since been removed or disabled in the
+# directory. This script finds those and, with --apply, revokes them.
+#
+# The default is a dry run. An LDAP error never counts as "user missing".
 
-# Zero Trust VPN Infrastructure - User Synchronization Script
-# This script synchronizes user accounts and access policies between different systems
-# including LDAP/AD, Authelia, and device inventory
+set -Eeuo pipefail
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
+LOG_FILE="${LOG_FILE:-$ZTVPN_LOG_DIR/user-sync.log}"
+LDAP_URI="${LDAP_URI:-}"
+LDAP_BASE_DN="${LDAP_BASE_DN:-}"
+LDAP_BIND_DN="${LDAP_BIND_DN:-}"
+LDAP_BIND_PASSWORD_FILE="${LDAP_BIND_PASSWORD_FILE:-$ZTVPN_SECRETS_DIR/ldap_bind_password}"
+# openldap | ad
+LDAP_FLAVOR="${LDAP_FLAVOR:-openldap}"
+LDAP_USER_FILTER="${LDAP_USER_FILTER:-}"
+# Optional DN of a group whose members may use the VPN (checked via memberOf).
+LDAP_REQUIRED_GROUP="${LDAP_REQUIRED_GROUP:-}"
+# Optional CA bundle for the directory's TLS certificate.
+LDAP_CA_CERT="${LDAP_CA_CERT:-}"
+LDAP_TIMEOUT="${LDAP_TIMEOUT:-15}"
+SYNC_MAX_REVOKE="${SYNC_MAX_REVOKE:-5}"
+# Comma separated local accounts that are not in the directory on purpose
+# (e.g. a break-glass admin). They are reported but never revoked.
+SYNC_IGNORE_USERS="${SYNC_IGNORE_USERS:-}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
-CONFIG_DIR="$PROJECT_ROOT/config-examples"
-SYNC_LOG_DIR="/var/log/zero-trust-vpn"
-SYNC_CONFIG="$PROJECT_ROOT/config/user-sync.conf"
-
-# Default configuration
-LDAP_SERVER=""
-LDAP_BASE_DN=""
-LDAP_BIND_DN=""
-LDAP_BIND_PASSWORD=""
-AUTHELIA_CONFIG="$CONFIG_DIR/authelia/users_database.yml"
-DEVICE_INVENTORY="$PROJECT_ROOT/device-inventory.json"
-SYNC_INTERVAL=3600  # 1 hour
-DRY_RUN=false
-VERBOSE=false
-
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$SYNC_LOG_DIR/user-sync.log"
-}
-
-warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1" >> "$SYNC_LOG_DIR/user-sync.log"
-}
-
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1" >> "$SYNC_LOG_DIR/user-sync.log"
-}
-
-info() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
-    if [[ "$VERBOSE" == "true" ]]; then
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1" >> "$SYNC_LOG_DIR/user-sync.log"
-    fi
-}
-
-# Display usage information
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") [--apply] [--force] [--max-revoke N] [--json]
 
-Zero Trust VPN User Synchronization Script
+Checks every VPN identity against the directory:
+  * owners of WireGuard peers in $WG_CONF
+  * users in $AUTHELIA_USERS_DB (only when AUTHELIA_BACKEND=file)
+A user that is missing, disabled/locked, or not in LDAP_REQUIRED_GROUP loses VPN access:
+peers removed (archived under $ZTVPN_BACKUP_DIR/user-sync), client certificates revoked,
+Authelia file account disabled.
 
-OPTIONS:
-    --source SOURCE         User source (ldap, ad, file, api)
-    --target TARGET         Sync target (authelia, inventory, all)
-    --config FILE           Configuration file path
-    --dry-run               Show what would be done without making changes
-    --daemon                Run as daemon with periodic sync
-    --interval SECONDS      Sync interval for daemon mode (default: 3600)
-    --force                 Force sync even if no changes detected
-    --backup                Create backup before sync
-    --verbose               Enable verbose logging
-    -h, --help              Show this help message
+  --apply          Actually revoke. Without it nothing is changed (dry run).
+  --max-revoke N   Refuse to revoke more than N users in one run (default $SYNC_MAX_REVOKE)
+  --force          Ignore --max-revoke
+  --json           Print results as JSON
+  -h, --help       Show this help
 
-SOURCES:
-    ldap        LDAP directory server
-    ad          Active Directory
-    file        CSV/JSON file
-    api         REST API endpoint
-
-TARGETS:
-    authelia    Authelia user database
-    inventory   Device inventory
-    all         All configured targets
-
-EXAMPLES:
-    $0 --source ldap --target authelia --dry-run
-    $0 --source ad --target all --backup --verbose
-    $0 --daemon --interval 1800
-    $0 --source file --config /path/to/users.csv
-
+Configuration (ztvpn.conf):
+  LDAP_URI                 ldaps://host[:port] or ldap://host (StartTLS is then required)
+  LDAP_BASE_DN             Search base for users
+  LDAP_BIND_DN             Bind DN (empty = anonymous bind)
+  LDAP_BIND_PASSWORD_FILE  File with the bind password, mode 0600 (default $LDAP_BIND_PASSWORD_FILE)
+  LDAP_FLAVOR              openldap (uid, pwdAccountLockedTime) or ad (sAMAccountName,
+                           userAccountControl bit 2 = disabled)
+  LDAP_USER_FILTER         Extra filter ANDed into the search, e.g. (objectClass=inetOrgPerson)
+  LDAP_REQUIRED_GROUP      Group DN required in memberOf (optional)
+  LDAP_CA_CERT             CA bundle for the directory certificate (optional)
+  SYNC_IGNORE_USERS        Comma separated local accounts that are never revoked
 EOF
 }
 
-# Parse command line arguments
-parse_args() {
-    SOURCE=""
-    TARGET="all"
-    CONFIG_FILE=""
-    DAEMON_MODE=false
-    FORCE_SYNC=false
-    CREATE_BACKUP=false
+# --------------------------------------------------------------------------
+# LDAP
+# --------------------------------------------------------------------------
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --source)
-                SOURCE="$2"
-                shift 2
+WORK=""
+PWFILE=""
+LDAP_ARGS=()
+UID_ATTR=""
+
+# RFC 4515 escaping for a value inside a filter.
+ldap_escape() {
+    local v="$1"
+    v="${v//\\/\\5c}"
+    v="${v//\*/\\2a}"
+    v="${v//(/\\28}"
+    v="${v//)/\\29}"
+    printf '%s' "$v"
+}
+
+validate_ldap_config() {
+    [[ -n "$LDAP_URI" ]] || die "LDAP_URI is not set"
+    [[ "$LDAP_URI" =~ ^ldaps?://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] ||
+        die "LDAP_URI must be a single ldaps://host[:port] or ldap://host[:port] URI"
+    [[ -n "$LDAP_BASE_DN" && "$LDAP_BASE_DN" =~ ^[[:print:]]+$ ]] || die "LDAP_BASE_DN is not set or invalid"
+    [[ -z "$LDAP_BIND_DN" || "$LDAP_BIND_DN" =~ ^[[:print:]]+$ ]] || die "LDAP_BIND_DN is invalid"
+    [[ "$LDAP_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] || die "LDAP_TIMEOUT is invalid"
+    case "${LDAPTLS_REQCERT:-}" in
+        never | allow) die "LDAPTLS_REQCERT=${LDAPTLS_REQCERT} disables certificate verification; refusing" ;;
+    esac
+    case "$LDAP_FLAVOR" in
+        openldap) UID_ATTR=uid; : "${LDAP_USER_FILTER:=(objectClass=person)}" ;;
+        ad) UID_ATTR=sAMAccountName; : "${LDAP_USER_FILTER:=(&(objectCategory=person)(objectClass=user))}" ;;
+        *) die "LDAP_FLAVOR must be openldap or ad" ;;
+    esac
+    [[ "$LDAP_USER_FILTER" == \(*\) && "$LDAP_USER_FILTER" != *$'\n'* ]] || die "LDAP_USER_FILTER must be a parenthesised filter"
+    if [[ -n "$LDAP_CA_CERT" ]]; then
+        [[ -f "$LDAP_CA_CERT" ]] || die "LDAP_CA_CERT $LDAP_CA_CERT not found"
+        export LDAPTLS_CACERT="$LDAP_CA_CERT"
+    fi
+    export LDAPTLS_REQCERT=demand
+
+    LDAP_ARGS=(-LLL -x -H "$LDAP_URI" -o ldif-wrap=no -o "nettimeout=$LDAP_TIMEOUT" -l "$LDAP_TIMEOUT")
+    # Plain ldap:// is only accepted with mandatory StartTLS.
+    [[ "$LDAP_URI" == ldap://* ]] && LDAP_ARGS+=(-ZZ)
+
+    if [[ -n "$LDAP_BIND_DN" ]]; then
+        local f="$LDAP_BIND_PASSWORD_FILE" perms owner
+        [[ -f "$f" ]] || die "Bind password file $f not found"
+        perms="$(stat -c %a "$f")"
+        owner="$(stat -c %u "$f")"
+        (((8#$perms & 8#077) == 0)) || die "Bind password file $f must not be group/world accessible (mode $perms)"
+        [[ "$owner" == 0 || "$owner" == "$(id -u)" ]] || die "Bind password file $f has an unexpected owner"
+        # ldapsearch -y uses the file byte for byte; drop a trailing newline.
+        local pw
+        pw="$(<"$f")"
+        [[ -n "$pw" ]] || die "Bind password file $f is empty"
+        PWFILE="$WORK/bindpw"
+        printf '%s' "$pw" >"$PWFILE"
+        unset pw
+        LDAP_ARGS+=(-D "$LDAP_BIND_DN" -y "$PWFILE")
+    else
+        warn "LDAP_BIND_DN is empty, using an anonymous bind"
+    fi
+}
+
+# Reads -LLL LDIF on stdin; prints "<entry>\t<attr-lowercase>\t<value>".
+# Folded lines are joined and "attr:: base64" values decoded.
+LDIF_ENTRY=0
+_ldif_emit() {
+    local l="$1" attr val
+    [[ "$l" == *:* ]] || return 0
+    attr="${l%%:*}"
+    val="${l#*:}"
+    attr="${attr%%;*}"
+    [[ "${attr,,}" == dn ]] && LDIF_ENTRY=$((LDIF_ENTRY + 1))
+    if [[ "$val" == :* ]]; then
+        val="$(printf '%s' "${val#:}" | tr -d ' ' | base64 -d 2>/dev/null)" || {
+            warn "Undecodable base64 value for attribute $attr"
+            return 0
+        }
+    elif [[ "$val" == \<* ]]; then
+        return 0
+    else
+        val="${val# }"
+    fi
+    val="${val//[$'\t\r\n']/ }"
+    printf '%s\t%s\t%s\n' "$LDIF_ENTRY" "${attr,,}" "$val"
+}
+
+parse_ldif() {
+    local line logical=""
+    LDIF_ENTRY=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ "$line" == " "* && -n "$logical" ]]; then
+            logical+="${line:1}"
+            continue
+        fi
+        [[ -n "$logical" ]] && _ldif_emit "$logical"
+        logical="$line"
+    done
+    [[ -n "$logical" ]] && _ldif_emit "$logical"
+    return 0
+}
+
+# Prints one of: active, missing, disabled, not-in-group, ambiguous.
+# Returns 1 if the directory could not be queried.
+ldap_user_status() {
+    local user="$1" filter out rc=0
+    filter="(&${LDAP_USER_FILTER}(${UID_ATTR}=$(ldap_escape "$user")))"
+    local -a attrs
+    if [[ "$LDAP_FLAVOR" == ad ]]; then
+        attrs=(sAMAccountName userAccountControl memberOf)
+    else
+        attrs=(uid pwdAccountLockedTime memberOf)
+    fi
+    out="$(ldapsearch "${LDAP_ARGS[@]}" -b "$LDAP_BASE_DN" -s sub "$filter" "${attrs[@]}" 2>"$WORK/ldap.err")" || rc=$?
+    if ((rc != 0)); then
+        error "ldapsearch failed for $user (exit $rc): $(head -c 300 "$WORK/ldap.err" | tr '\n' ' ')"
+        return 1
+    fi
+
+    local parsed
+    parsed="$(parse_ldif <<<"$out")"
+    # Entries whose naming attribute equals the user (case-insensitive,
+    # AD compares sAMAccountName that way).
+    local -a entries
+    mapfile -t entries < <(awk -F'\t' -v a="${UID_ATTR,,}" -v u="${user,,}" '$2 == a && tolower($3) == u { print $1 }' <<<"$parsed" | sort -u)
+    if ((${#entries[@]} == 0)); then
+        echo missing
+        return 0
+    fi
+    if ((${#entries[@]} > 1)); then
+        echo ambiguous
+        return 0
+    fi
+    local e="${entries[0]}"
+    if [[ "$LDAP_FLAVOR" == ad ]]; then
+        local uac
+        uac="$(awk -F'\t' -v e="$e" '$1 == e && $2 == "useraccountcontrol" { print $3; exit }' <<<"$parsed")"
+        if [[ ! "$uac" =~ ^[0-9]+$ ]]; then
+            error "No readable userAccountControl for $user; treating as error"
+            return 1
+        fi
+        ((uac & 2)) && { echo disabled; return 0; }
+    else
+        if awk -F'\t' -v e="$e" '$1 == e && $2 == "pwdaccountlockedtime" && $3 != "" { f = 1 } END { exit !f }' <<<"$parsed"; then
+            echo disabled
+            return 0
+        fi
+    fi
+    if [[ -n "$LDAP_REQUIRED_GROUP" ]]; then
+        if ! awk -F'\t' -v e="$e" -v g="${LDAP_REQUIRED_GROUP,,}" '$1 == e && $2 == "memberof" && tolower($3) == g { f = 1 } END { exit !f }' <<<"$parsed"; then
+            echo not-in-group
+            return 0
+        fi
+    fi
+    echo active
+}
+
+# --------------------------------------------------------------------------
+# Revocation (library functions, no shelling out to other scripts)
+# --------------------------------------------------------------------------
+
+revoke_access() {
+    local user="$1" archive="$2" p rc ok=0
+    local -a peers
+    mapfile -t peers < <(wg_user_peers "$user")
+    for p in "${peers[@]}"; do
+        [[ -n "$p" ]] || continue
+        if wg_deprovision_peer "$p" "$archive"; then
+            info "Removed peer $p (archived in $archive)"
+        else
+            error "Could not remove peer $p"
+            ok=1
+        fi
+    done
+    if pki_ca_exists; then
+        for p in "${peers[@]}" "$user"; do
+            [[ -n "$p" ]] || continue
+            rc=0
+            pki_revoke "$p" cessationOfOperation >/dev/null 2>&1 || rc=$?
+            case "$rc" in
+                0) info "Revoked client certificate(s) CN=$p" ;;
+                2) ;;
+                *) error "Revoking certificates for $p failed"; ok=1 ;;
+            esac
+        done
+    fi
+    if [[ "$AUTHELIA_BACKEND" == file ]] && authelia_user_exists "$user"; then
+        if authelia_set_disabled "$user" true; then
+            info "Disabled Authelia account $user"
+        else
+            ok=1
+        fi
+    fi
+    return "$ok"
+}
+
+# --------------------------------------------------------------------------
+
+main() {
+    local apply=0 force=0 json=0
+    while (($#)); do
+        case "$1" in
+            --apply) apply=1; shift ;;
+            --dry-run) apply=0; shift ;;
+            --force) force=1; shift ;;
+            --max-revoke) SYNC_MAX_REVOKE="${2:-}"; shift 2 || die "--max-revoke needs a value" ;;
+            --json) json=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) usage >&2; die "Unknown option: $1" ;;
+        esac
+    done
+    [[ "$SYNC_MAX_REVOKE" =~ ^[0-9]+$ ]] || die "Invalid --max-revoke"
+    require_cmd ldapsearch jq base64
+    ((apply == 0)) || require_root
+
+    WORK="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$WORK'" EXIT
+    validate_ldap_config
+
+    # Collect identities: "user<TAB>source"
+    local -A sources=()
+    local n _ip _k u
+    while read -r n _ip _k; do
+        [[ -n "$n" ]] || continue
+        u="${n%%--*}"
+        sources["$u"]+="wireguard,"
+    done < <(wg_list_peers)
+    if [[ "$AUTHELIA_BACKEND" == file ]]; then
+        require_yq || die "yq is required for AUTHELIA_BACKEND=file"
+        while IFS= read -r u; do
+            [[ -n "$u" ]] && sources["$u"]+="authelia,"
+        done < <(authelia_list_users)
+    fi
+
+    local -a results=()
+    local -a to_revoke=()
+    local errors=0 status
+    for u in "${!sources[@]}"; do
+        if ! validate_username "$u"; then
+            warn "Skipping identity with an invalid name (not sent to LDAP): $(printf '%q' "$u")"
+            results+=("$u"$'\t'invalid-name$'\t'"${sources[$u]%,}"$'\t'none)
+            errors=1
+            continue
+        fi
+        if split_csv "$SYNC_IGNORE_USERS" | grep -qxF -- "$u"; then
+            results+=("$u"$'\t'ignored$'\t'"${sources[$u]%,}"$'\t'none)
+            continue
+        fi
+        if ! status="$(ldap_user_status "$u")"; then
+            results+=("$u"$'\t'ldap-error$'\t'"${sources[$u]%,}"$'\t'none)
+            errors=1
+            continue
+        fi
+        case "$status" in
+            missing | disabled | not-in-group)
+                to_revoke+=("$u")
+                results+=("$u"$'\t'"$status"$'\t'"${sources[$u]%,}"$'\t'"$( ((apply)) && echo revoke || echo would-revoke)")
                 ;;
-            --target)
-                TARGET="$2"
-                shift 2
-                ;;
-            --config)
-                CONFIG_FILE="$2"
-                shift 2
-                ;;
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            --daemon)
-                DAEMON_MODE=true
-                shift
-                ;;
-            --interval)
-                SYNC_INTERVAL="$2"
-                shift 2
-                ;;
-            --force)
-                FORCE_SYNC=true
-                shift
-                ;;
-            --backup)
-                CREATE_BACKUP=true
-                shift
-                ;;
-            --verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
+            ambiguous)
+                warn "More than one directory entry matches $u; not touching it"
+                results+=("$u"$'\t'ambiguous$'\t'"${sources[$u]%,}"$'\t'none)
+                errors=1
                 ;;
             *)
-                error "Unknown option: $1"
-                exit 1
+                results+=("$u"$'\t'"$status"$'\t'"${sources[$u]%,}"$'\t'none)
                 ;;
         esac
     done
 
-    # Validate required parameters
-    if [[ -z "$SOURCE" && "$DAEMON_MODE" == "false" ]]; then
-        error "Source is required. Use --source option"
-        exit 1
-    fi
-
-    # Load configuration file if specified
-    if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
-    elif [[ -f "$SYNC_CONFIG" ]]; then
-        source "$SYNC_CONFIG"
-    fi
-}
-
-# Initialize synchronization environment
-init_sync_environment() {
-    log "Initializing user synchronization environment..."
-
-    # Create log directory
-    mkdir -p "$SYNC_LOG_DIR"
-
-    # Check prerequisites
-    local required_commands=("jq" "yq")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            error "Required command not found: $cmd"
-            exit 1
+    if ((apply && ${#to_revoke[@]} > 0)); then
+        if ((${#to_revoke[@]} > SYNC_MAX_REVOKE && !force)); then
+            die "${#to_revoke[@]} users would lose access (limit $SYNC_MAX_REVOKE). Check the directory settings, then rerun with --force or --max-revoke"
         fi
-    done
-
-    # Check LDAP tools if LDAP source is used
-    if [[ "$SOURCE" == "ldap" || "$SOURCE" == "ad" ]]; then
-        if ! command -v ldapsearch &> /dev/null; then
-            error "LDAP tools not found. Install ldap-utils package"
-            exit 1
-        fi
-    fi
-
-    # Create backup if requested
-    if [[ "$CREATE_BACKUP" == "true" ]]; then
-        create_backup
-    fi
-}
-
-# Create backup of current configuration
-create_backup() {
-    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_dir="$PROJECT_ROOT/backups/user-sync/$backup_timestamp"
-
-    log "Creating backup..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would create backup in $backup_dir"
-        return
-    fi
-
-    mkdir -p "$backup_dir"
-
-    # Backup Authelia user database
-    if [[ -f "$AUTHELIA_CONFIG" ]]; then
-        cp "$AUTHELIA_CONFIG" "$backup_dir/users_database.yml.backup"
-    fi
-
-    # Backup device inventory
-    if [[ -f "$DEVICE_INVENTORY" ]]; then
-        cp "$DEVICE_INVENTORY" "$backup_dir/device-inventory.json.backup"
-    fi
-
-    log "Backup created in: $backup_dir"
-}
-
-# Fetch users from LDAP
-fetch_ldap_users() {
-    log "Fetching users from LDAP server: $LDAP_SERVER"
-
-    if [[ -z "$LDAP_SERVER" || -z "$LDAP_BASE_DN" ]]; then
-        error "LDAP configuration incomplete"
-        return 1
-    fi
-
-    local ldap_users_file="/tmp/ldap_users_$$.json"
-    local ldap_filter="(objectClass=person)"
-
-    # Build LDAP search command
-    local ldap_cmd="ldapsearch -x -H $LDAP_SERVER -b $LDAP_BASE_DN"
-    
-    if [[ -n "$LDAP_BIND_DN" ]]; then
-        ldap_cmd="$ldap_cmd -D $LDAP_BIND_DN"
-        if [[ -n "$LDAP_BIND_PASSWORD" ]]; then
-            ldap_cmd="$ldap_cmd -w $LDAP_BIND_PASSWORD"
-        fi
-    fi
-
-    ldap_cmd="$ldap_cmd $ldap_filter uid mail cn memberOf"
-
-    info "Executing LDAP search..."
-    
-    # Execute LDAP search and convert to JSON
-    if $ldap_cmd > "/tmp/ldap_raw_$$.txt" 2>/dev/null; then
-        # Parse LDAP output to JSON (simplified parser)
-        python3 << EOF > "$ldap_users_file"
-import re
-import json
-
-users = []
-current_user = {}
-
-with open('/tmp/ldap_raw_$$.txt', 'r') as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith('dn:'):
-            if current_user:
-                users.append(current_user)
-            current_user = {'dn': line[3:].strip()}
-        elif line.startswith('uid:'):
-            current_user['username'] = line[4:].strip()
-        elif line.startswith('mail:'):
-            current_user['email'] = line[5:].strip()
-        elif line.startswith('cn:'):
-            current_user['displayname'] = line[3:].strip()
-        elif line.startswith('memberOf:'):
-            if 'groups' not in current_user:
-                current_user['groups'] = []
-            group = line[9:].strip()
-            # Extract group name from DN
-            group_name = re.search(r'cn=([^,]+)', group)
-            if group_name:
-                current_user['groups'].append(group_name.group(1))
-
-if current_user:
-    users.append(current_user)
-
-print(json.dumps({'users': users}, indent=2))
-EOF
-
-        rm -f "/tmp/ldap_raw_$$.txt"
-        echo "$ldap_users_file"
-    else
-        error "Failed to fetch users from LDAP"
-        rm -f "/tmp/ldap_raw_$$.txt"
-        return 1
-    fi
-}
-
-# Fetch users from Active Directory
-fetch_ad_users() {
-    log "Fetching users from Active Directory..."
-    
-    # AD is similar to LDAP but with different attributes
-    # This would use the same LDAP tools but with AD-specific filters
-    fetch_ldap_users
-}
-
-# Fetch users from file
-fetch_file_users() {
-    local file_path="$CONFIG_FILE"
-    
-    log "Loading users from file: $file_path"
-
-    if [[ ! -f "$file_path" ]]; then
-        error "User file not found: $file_path"
-        return 1
-    fi
-
-    # Detect file format and convert to standard JSON
-    if [[ "$file_path" == *.csv ]]; then
-        # Convert CSV to JSON
-        python3 << EOF > "/tmp/file_users_$$.json"
-import csv
-import json
-
-users = []
-with open('$file_path', 'r') as csvfile:
-    reader = csv.DictReader(csvfile)
-    for row in reader:
-        user = {
-            'username': row.get('username', ''),
-            'email': row.get('email', ''),
-            'displayname': row.get('displayname', row.get('name', '')),
-            'groups': row.get('groups', 'standard').split(',')
-        }
-        users.append(user)
-
-print(json.dumps({'users': users}, indent=2))
-EOF
-        echo "/tmp/file_users_$$.json"
-    elif [[ "$file_path" == *.json ]]; then
-        echo "$file_path"
-    else
-        error "Unsupported file format. Use CSV or JSON"
-        return 1
-    fi
-}
-
-# Sync users to Authelia
-sync_to_authelia() {
-    local users_file="$1"
-    
-    log "Syncing users to Authelia..."
-
-    if [[ ! -f "$users_file" ]]; then
-        error "Users file not found: $users_file"
-        return 1
-    fi
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would sync $(jq '.users | length' "$users_file") users to Authelia"
-        return 0
-    fi
-
-    # Read users from source
-    local users_json=$(cat "$users_file")
-    
-    # Initialize Authelia users database if it doesn't exist
-    if [[ ! -f "$AUTHELIA_CONFIG" ]]; then
-        echo "users:" > "$AUTHELIA_CONFIG"
-    fi
-
-    # Process each user
-    echo "$users_json" | jq -r '.users[] | @base64' | while read -r user_data; do
-        local user=$(echo "$user_data" | base64 -d)
-        local username=$(echo "$user" | jq -r '.username')
-        local email=$(echo "$user" | jq -r '.email')
-        local displayname=$(echo "$user" | jq -r '.displayname')
-        local groups=$(echo "$user" | jq -r '.groups[]' | tr '\n' ',' | sed 's/,$//')
-
-        if [[ -n "$username" && -n "$email" ]]; then
-            # Check if user already exists
-            if yq eval ".users | has(\"$username\")" "$AUTHELIA_CONFIG" | grep -q "true"; then
-                info "Updating existing user: $username"
-                # Update user information
-                yq eval ".users.\"$username\".email = \"$email\"" -i "$AUTHELIA_CONFIG"
-                yq eval ".users.\"$username\".displayname = \"$displayname\"" -i "$AUTHELIA_CONFIG"
-                yq eval ".users.\"$username\".groups = [\"$groups\"]" -i "$AUTHELIA_CONFIG"
+        ztvpn_lock users
+        ztvpn_lock wg
+        ztvpn_lock pki
+        local archive
+        archive="$ZTVPN_BACKUP_DIR/user-sync/$(date -u +%Y%m%dT%H%M%SZ)"
+        for u in "${to_revoke[@]}"; do
+            if revoke_access "$u" "$archive"; then
+                success "Revoked VPN access of $u"
             else
-                info "Adding new user: $username"
-                # Generate temporary password (user must change on first login)
-                local temp_password="ChangeMe$(date +%s)"
-                local password_hash=$(echo -n "$temp_password" | argon2 "$(openssl rand -base64 32)" -e -id -k 65536 -t 3 -p 4)
-                
-                # Add new user
-                yq eval ".users.\"$username\" = {
-                    \"displayname\": \"$displayname\",
-                    \"password\": \"$password_hash\",
-                    \"email\": \"$email\",
-                    \"groups\": [\"$groups\"]
-                }" -i "$AUTHELIA_CONFIG"
-                
-                warn "User $username added with temporary password: $temp_password"
+                error "Revoking $u was incomplete"
+                errors=1
             fi
-        else
-            warn "Skipping user with incomplete information: $username"
-        fi
-    done
-
-    log "Authelia user sync completed"
-}
-
-# Sync users to device inventory
-sync_to_inventory() {
-    local users_file="$1"
-    
-    log "Syncing users to device inventory..."
-
-    if [[ ! -f "$users_file" ]]; then
-        error "Users file not found: $users_file"
-        return 1
-    fi
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "DRY RUN: Would update device inventory with user information"
-        return 0
-    fi
-
-    # Initialize device inventory if it doesn't exist
-    if [[ ! -f "$DEVICE_INVENTORY" ]]; then
-        echo '{"devices": []}' > "$DEVICE_INVENTORY"
-    fi
-
-    # Update device inventory with current user information
-    local users_json=$(cat "$users_file")
-    
-    echo "$users_json" | jq -r '.users[] | @base64' | while read -r user_data; do
-        local user=$(echo "$user_data" | base64 -d)
-        local username=$(echo "$user" | jq -r '.username')
-        local email=$(echo "$user" | jq -r '.email')
-        local groups=$(echo "$user" | jq -r '.groups[0]' 2>/dev/null || echo "standard")
-
-        # Update devices owned by this user
-        jq "(.devices[] | select(.username == \"$username\") | .email) = \"$email\"" \
-           "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-        
-        jq "(.devices[] | select(.username == \"$username\") | .access_level) = \"$groups\"" \
-           "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-        
-        jq "(.devices[] | select(.username == \"$username\") | .last_sync) = \"$(date -Iseconds)\"" \
-           "$DEVICE_INVENTORY" > "$DEVICE_INVENTORY.tmp" && mv "$DEVICE_INVENTORY.tmp" "$DEVICE_INVENTORY"
-    done
-
-    log "Device inventory sync completed"
-}
-
-# Perform user synchronization
-perform_sync() {
-    log "Starting user synchronization from $SOURCE to $TARGET"
-
-    local users_file=""
-
-    # Fetch users from source
-    case "$SOURCE" in
-        "ldap")
-            users_file=$(fetch_ldap_users)
-            ;;
-        "ad")
-            users_file=$(fetch_ad_users)
-            ;;
-        "file")
-            users_file=$(fetch_file_users)
-            ;;
-        "api")
-            error "API source not yet implemented"
-            return 1
-            ;;
-        *)
-            error "Unknown source: $SOURCE"
-            return 1
-            ;;
-    esac
-
-    if [[ -z "$users_file" || ! -f "$users_file" ]]; then
-        error "Failed to fetch users from source"
-        return 1
-    fi
-
-    local user_count=$(jq '.users | length' "$users_file")
-    log "Fetched $user_count users from $SOURCE"
-
-    # Sync to targets
-    case "$TARGET" in
-        "authelia")
-            sync_to_authelia "$users_file"
-            ;;
-        "inventory")
-            sync_to_inventory "$users_file"
-            ;;
-        "all")
-            sync_to_authelia "$users_file"
-            sync_to_inventory "$users_file"
-            ;;
-        *)
-            error "Unknown target: $TARGET"
-            return 1
-            ;;
-    esac
-
-    # Cleanup temporary files
-    if [[ "$users_file" == /tmp/* ]]; then
-        rm -f "$users_file"
-    fi
-
-    log "User synchronization completed successfully"
-}
-
-# Daemon mode
-run_daemon() {
-    log "Starting user sync daemon (interval: ${SYNC_INTERVAL}s)"
-
-    # Create PID file
-    local pid_file="/var/run/user-sync.pid"
-    echo $$ > "$pid_file"
-
-    # Trap signals for graceful shutdown
-    trap 'log "Shutting down user sync daemon"; rm -f "$pid_file"; exit 0' SIGTERM SIGINT
-
-    while true; do
-        log "Running scheduled user synchronization..."
-        
-        if perform_sync; then
-            log "Scheduled sync completed successfully"
-        else
-            error "Scheduled sync failed"
-        fi
-
-        log "Next sync in ${SYNC_INTERVAL} seconds"
-        sleep "$SYNC_INTERVAL"
-    done
-}
-
-# Main execution
-main() {
-    init_sync_environment
-
-    if [[ "$DAEMON_MODE" == "true" ]]; then
-        run_daemon
+        done
+    elif ((${#to_revoke[@]} > 0)); then
+        warn "Dry run: ${#to_revoke[@]} user(s) would lose VPN access: ${to_revoke[*]}. Rerun with --apply."
     else
-        perform_sync
+        info "All VPN identities are active in the directory"
     fi
+
+    if ((json)); then
+        if ((${#results[@]})); then
+            printf '%s\n' "${results[@]}" | jq -R 'split("\t") | {user: .[0], status: .[1], sources: (.[2] | split(",")), action: .[3]}' | jq -s --argjson applied "$apply" '{applied: ($applied == 1), results: .}'
+        else
+            jq -n --argjson applied "$apply" '{applied: ($applied == 1), results: []}'
+        fi
+    else
+        printf '%-24s %-13s %-20s %s\n' USER STATUS SOURCES ACTION
+        if ((${#results[@]})); then
+            local r
+            for r in "${results[@]}"; do
+                IFS=$'\t' read -r u status n _k <<<"$r"
+                printf '%-24s %-13s %-20s %s\n' "$(printf '%q' "$u")" "$status" "$n" "$_k"
+            done | sort
+        fi
+    fi
+    return "$errors"
 }
 
-# Parse arguments and run main function
-parse_args "$@"
-main
+main "$@"

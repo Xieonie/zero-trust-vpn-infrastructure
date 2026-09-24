@@ -1,651 +1,341 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Reports WireGuard peer state and failed Authelia logins, raises alerts.
+#
+# Data comes from "wg show <if> dump" (raw byte counters and epoch
+# handshakes, no unit parsing) and from Authelia's log within a time
+# window. Alerts go to $ZTVPN_LOG_DIR/alerts.log. With --respond, source
+# IPs with too many failed logins are handed to threat-response.sh.
 
-# Zero Trust VPN - Connection Monitoring Script
-# This script monitors VPN connections, detects anomalies, and generates alerts
+set -Eeuo pipefail
+# shellcheck source=scripts/lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
 
-set -euo pipefail
+ALERT_LOG="${ALERT_LOG:-$ZTVPN_LOG_DIR/alerts.log}"
+MONITOR_STATE="${MONITOR_STATE:-$ZTVPN_STATE_DIR/monitor/wg-sample.json}"
+# Authelia logs: a file, an explicit container, or the compose service.
+AUTHELIA_CONTAINER="${AUTHELIA_CONTAINER:-}"
+AUTHELIA_SERVICE="${AUTHELIA_SERVICE:-authelia}"
+COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-$COMPOSE_DIR/docker-compose.yml}"
+AUTHELIA_LOG_FILE="${AUTHELIA_LOG_FILE:-}"
+# A handshake younger than this means the peer is connected.
+MONITOR_ACTIVE_SECS="${MONITOR_ACTIVE_SECS:-180}"
+# Average bytes/second per direction between two samples that counts as a spike.
+MONITOR_SPIKE_BPS="${MONITOR_SPIKE_BPS:-12500000}"
+# Failed logins from one source IP within the window that raise an alert.
+MONITOR_AUTH_FAIL_THRESHOLD="${MONITOR_AUTH_FAIL_THRESHOLD:-10}"
+MONITOR_BLOCK_DURATION="${MONITOR_BLOCK_DURATION:-1h}"
+THREAT_RESPONSE="${THREAT_RESPONSE:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../automation/threat-response.sh}"
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-LOG_FILE="/var/log/zero-trust-vpn/connection-monitor.log"
-ALERT_LOG="/var/log/zero-trust-vpn/alerts.log"
-CONFIG_FILE="/opt/zero-trust-vpn/config/monitoring.conf"
-WG_INTERFACE="wg0"
-
-# Monitoring thresholds
-MAX_FAILED_ATTEMPTS=5
-SUSPICIOUS_TRAFFIC_THRESHOLD=1000000  # 1MB/s
-MAX_CONCURRENT_CONNECTIONS=10
-ANOMALY_DETECTION_WINDOW=300  # 5 minutes
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Logging function
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-}
-
-# Alert function
-alert() {
-    local severity="$1"
-    local message="$2"
-    local alert_msg="$(date '+%Y-%m-%d %H:%M:%S') - [$severity] $message"
-    
-    echo "$alert_msg" | tee -a "$ALERT_LOG"
-    
-    # Send notifications based on severity
-    case "$severity" in
-        "CRITICAL")
-            send_notification "🚨 CRITICAL ALERT" "$message" "high"
-            ;;
-        "WARNING")
-            send_notification "⚠️ WARNING" "$message" "medium"
-            ;;
-        "INFO")
-            send_notification "ℹ️ INFO" "$message" "low"
-            ;;
-    esac
-}
-
-# Error handling
-error_exit() {
-    echo -e "${RED}ERROR: $1${NC}" >&2
-    log "ERROR: $1"
-    alert "CRITICAL" "Monitoring script error: $1"
-    exit 1
-}
-
-# Success function
-success() {
-    echo -e "${GREEN}SUCCESS: $1${NC}"
-    log "SUCCESS: $1"
-}
-
-# Info function
-info() {
-    echo -e "${BLUE}INFO: $1${NC}"
-    log "INFO: $1"
-}
-
-# Usage function
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<EOF
+Usage: $(basename "$0") [--once | --watch SECONDS] [--window 10m] [--json] [--respond]
 
-Monitor Zero Trust VPN connections and detect anomalies
+  --once          One sample (default). Exit 0 = no alerts, 1 = alerts, 2 = error.
+  --watch N       Sample every N seconds until interrupted (window defaults to N seconds).
+  --window W      Look-back for failed Authelia logins, e.g. 300s, 10m, 1h (default 10m).
+  --json          Print the report as JSON.
+  --respond       Pass source IPs with >= $MONITOR_AUTH_FAIL_THRESHOLD failed logins to
+                  threat-response.sh --type brute-force (blocked for $MONITOR_BLOCK_DURATION).
+  -h, --help      Show this help
 
-OPTIONS:
-    -i, --interface INTERFACE   WireGuard interface to monitor (default: wg0)
-    -c, --continuous            Run in continuous monitoring mode
-    -a, --analyze-logs          Analyze historical logs for patterns
-    -r, --report                Generate monitoring report
-    -t, --test-alerts           Test alert system
-    -h, --help                  Show this help message
-
-EXAMPLES:
-    $0                          # Single monitoring check
-    $0 --continuous             # Continuous monitoring
-    $0 --analyze-logs           # Analyze log patterns
-    $0 --report                 # Generate report
-
+Reported: peers (name from $WG_CONF), handshake age, transfer, peers on $WG_INTERFACE that are
+not in $WG_CONF (alert), managed peers missing from the interface, transfer spikes against
+the previous sample ($MONITOR_STATE), failed 1FA/2FA logins from
+AUTHELIA_LOG_FILE, container AUTHELIA_CONTAINER, or compose service $AUTHELIA_SERVICE.
 EOF
 }
 
-# Parse command line arguments
-CONTINUOUS=false
-ANALYZE_LOGS=false
-GENERATE_REPORT=false
-TEST_ALERTS=false
+fatal() { error "$*"; exit 2; }
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -i|--interface)
-            WG_INTERFACE="$2"
-            shift 2
-            ;;
-        -c|--continuous)
-            CONTINUOUS=true
-            shift
-            ;;
-        -a|--analyze-logs)
-            ANALYZE_LOGS=true
-            shift
-            ;;
-        -r|--report)
-            GENERATE_REPORT=true
-            shift
-            ;;
-        -t|--test-alerts)
-            TEST_ALERTS=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            error_exit "Unknown option: $1"
-            ;;
-    esac
-done
-
-# Create log directories
-mkdir -p "$(dirname "$LOG_FILE")"
-mkdir -p "$(dirname "$ALERT_LOG")"
-
-# Function to load configuration
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
-    else
-        # Create default configuration
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-        cat > "$CONFIG_FILE" << EOF
-# Connection Monitoring Configuration
-
-# Thresholds
-MAX_FAILED_ATTEMPTS=5
-SUSPICIOUS_TRAFFIC_THRESHOLD=1000000
-MAX_CONCURRENT_CONNECTIONS=10
-ANOMALY_DETECTION_WINDOW=300
-
-# Notification settings
-WEBHOOK_URL=""
-SLACK_WEBHOOK=""
-EMAIL_ALERTS=true
-ADMIN_EMAIL="admin@example.com"
-
-# SMTP settings
-SMTP_SERVER="localhost"
-SMTP_PORT=587
-SMTP_USER=""
-SMTP_PASSWORD=""
-
-# Monitoring intervals
-CHECK_INTERVAL=60
-LOG_RETENTION_DAYS=30
-ALERT_RETENTION_DAYS=90
-EOF
-        info "Created default configuration: $CONFIG_FILE"
-    fi
-}
-
-# Function to get WireGuard statistics
-get_wireguard_stats() {
-    local interface="$1"
-    
-    if ! ip link show "$interface" >/dev/null 2>&1; then
-        alert "CRITICAL" "WireGuard interface $interface is not available"
-        return 1
-    fi
-    
-    # Get interface statistics
-    local stats
-    stats=$(wg show "$interface" 2>/dev/null || echo "")
-    
-    if [[ -z "$stats" ]]; then
-        alert "WARNING" "Unable to retrieve WireGuard statistics for $interface"
-        return 1
-    fi
-    
-    echo "$stats"
-}
-
-# Function to monitor active connections
-monitor_connections() {
-    local interface="$1"
-    
-    info "Monitoring connections on interface: $interface"
-    
-    # Get current connections
-    local connections
-    connections=$(wg show "$interface" peers 2>/dev/null | wc -l || echo "0")
-    
-    log "Active connections: $connections"
-    
-    # Check for too many concurrent connections
-    if [[ $connections -gt $MAX_CONCURRENT_CONNECTIONS ]]; then
-        alert "WARNING" "High number of concurrent connections: $connections (threshold: $MAX_CONCURRENT_CONNECTIONS)"
-    fi
-    
-    # Analyze each peer
-    while IFS= read -r peer; do
-        if [[ -n "$peer" ]]; then
-            analyze_peer_connection "$interface" "$peer"
-        fi
-    done < <(wg show "$interface" peers 2>/dev/null || true)
-}
-
-# Function to analyze individual peer connections
-analyze_peer_connection() {
-    local interface="$1"
-    local peer="$2"
-    
-    # Get peer information
-    local peer_info
-    peer_info=$(wg show "$interface" peer "$peer" 2>/dev/null || echo "")
-    
-    if [[ -z "$peer_info" ]]; then
-        return
-    fi
-    
-    # Extract connection details
-    local endpoint
-    endpoint=$(echo "$peer_info" | grep "endpoint:" | awk '{print $2}' || echo "unknown")
-    
-    local latest_handshake
-    latest_handshake=$(echo "$peer_info" | grep "latest handshake:" | cut -d':' -f2- | xargs || echo "never")
-    
-    local transfer
-    transfer=$(echo "$peer_info" | grep "transfer:" | cut -d':' -f2- | xargs || echo "0 B received, 0 B sent")
-    
-    # Parse transfer data
-    local received sent
-    received=$(echo "$transfer" | awk '{print $1, $2}' | sed 's/,//')
-    sent=$(echo "$transfer" | awk '{print $4, $5}')
-    
-    # Convert to bytes for analysis
-    local received_bytes sent_bytes
-    received_bytes=$(convert_to_bytes "$received")
-    sent_bytes=$(convert_to_bytes "$sent")
-    
-    # Check for suspicious traffic patterns
-    check_traffic_anomalies "$peer" "$received_bytes" "$sent_bytes"
-    
-    # Check handshake freshness
-    check_handshake_freshness "$peer" "$latest_handshake"
-    
-    # Log connection details
-    log "Peer: $peer, Endpoint: $endpoint, Handshake: $latest_handshake, Transfer: $transfer"
-}
-
-# Function to convert human-readable sizes to bytes
-convert_to_bytes() {
-    local size="$1"
-    local number unit
-    
-    number=$(echo "$size" | awk '{print $1}')
-    unit=$(echo "$size" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-    
-    case "$unit" in
-        "B"|"BYTES")
-            echo "$number"
-            ;;
-        "KB"|"KIB")
-            echo $((number * 1024))
-            ;;
-        "MB"|"MIB")
-            echo $((number * 1024 * 1024))
-            ;;
-        "GB"|"GIB")
-            echo $((number * 1024 * 1024 * 1024))
-            ;;
-        *)
-            echo "0"
-            ;;
+window_seconds() {
+    [[ "$1" =~ ^([1-9][0-9]{0,6})([smh])$ ]] || return 1
+    case "${BASH_REMATCH[2]}" in
+        s) echo "${BASH_REMATCH[1]}" ;;
+        m) echo $((BASH_REMATCH[1] * 60)) ;;
+        h) echo $((BASH_REMATCH[1] * 3600)) ;;
     esac
 }
 
-# Function to check traffic anomalies
-check_traffic_anomalies() {
-    local peer="$1"
-    local received_bytes="$2"
-    local sent_bytes="$3"
-    
-    # Calculate total traffic
-    local total_traffic=$((received_bytes + sent_bytes))
-    
-    # Check against threshold (per monitoring window)
-    local traffic_rate=$((total_traffic / ANOMALY_DETECTION_WINDOW))
-    
-    if [[ $traffic_rate -gt $SUSPICIOUS_TRAFFIC_THRESHOLD ]]; then
-        alert "WARNING" "Suspicious traffic volume from peer $peer: $(($traffic_rate / 1024 / 1024)) MB/s"
-    fi
-    
-    # Check for unusual patterns
-    if [[ $received_bytes -gt 0 && $sent_bytes -eq 0 ]]; then
-        alert "INFO" "Peer $peer shows download-only pattern (potential data exfiltration)"
-    elif [[ $sent_bytes -gt 0 && $received_bytes -eq 0 ]]; then
-        alert "INFO" "Peer $peer shows upload-only pattern (potential data injection)"
-    fi
+human() {
+    numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || printf '%sB' "$1"
 }
 
-# Function to check handshake freshness
-check_handshake_freshness() {
-    local peer="$1"
-    local handshake="$2"
-    
-    if [[ "$handshake" == "never" ]]; then
-        alert "WARNING" "Peer $peer has never completed a handshake"
-        return
-    fi
-    
-    # Parse handshake time (this is simplified - actual parsing would be more complex)
-    if echo "$handshake" | grep -q "hour\|day"; then
-        alert "WARNING" "Peer $peer has stale handshake: $handshake"
-    fi
+ALERTS=()
+alert() {
+    local sev="$1" src="$2" msg="$3"
+    ALERTS+=("$sev"$'\t'"$src"$'\t'"$msg")
+    mkdir -p "$(dirname "$ALERT_LOG")"
+    printf '%s %s connection-monitor/%s %s\n' "$(date -Iseconds)" "${sev^^}" "$src" "$msg" >>"$ALERT_LOG"
+    warn "ALERT [$sev] $msg"
 }
 
-# Function to monitor authentication logs
-monitor_auth_logs() {
-    info "Monitoring authentication logs..."
-    
-    # Check Authelia logs for failed attempts
-    local authelia_log="/var/log/authelia/authelia.log"
-    if [[ -f "$authelia_log" ]]; then
-        local failed_attempts
-        failed_attempts=$(grep -c "authentication failed" "$authelia_log" 2>/dev/null || echo "0")
-        
-        if [[ $failed_attempts -gt $MAX_FAILED_ATTEMPTS ]]; then
-            alert "WARNING" "High number of authentication failures: $failed_attempts"
+# --------------------------------------------------------------------------
+# WireGuard
+# --------------------------------------------------------------------------
+
+PEERS_NDJSON=""
+
+collect_wireguard() {
+    local dump now
+    dump="$(wg show "$WG_INTERFACE" dump 2>&1)" || fatal "wg show $WG_INTERFACE dump failed: $dump"
+    now="$(date +%s)"
+
+    local -A name_of=() managed_ip=() seen=()
+    local n ip k
+    while read -r n ip k; do
+        [[ -n "$k" ]] || continue
+        name_of["$k"]="$n"
+        managed_ip["$k"]="$ip"
+    done < <(wg_list_peers)
+
+    local -A prev_rx=() prev_tx=()
+    local prev_ts=0
+    if [[ -f "$MONITOR_STATE" ]] && jq -e . "$MONITOR_STATE" >/dev/null 2>&1; then
+        prev_ts="$(jq -r '.ts // 0' "$MONITOR_STATE")"
+        while IFS=$'\t' read -r k n ip; do
+            prev_rx["$k"]="$n"
+            prev_tx["$k"]="$ip"
+        done < <(jq -r '.peers // {} | to_entries[] | [.key, (.value.rx|tostring), (.value.tx|tostring)] | @tsv' "$MONITOR_STATE")
+    fi
+    [[ "$prev_ts" =~ ^[0-9]+$ ]] || prev_ts=0
+    local dt=$((now - prev_ts))
+
+    local line pub _psk endpoint allowed hs rx tx _ka name age status rrate trate first=1
+    : >"$PEERS_NDJSON"
+    local -a sample=()
+    while IFS=$'\t' read -r pub _psk endpoint allowed hs rx tx _ka; do
+        if ((first)); then
+            first=0 # interface line: private key, public key, port, fwmark
+            continue
         fi
+        [[ -n "$pub" ]] || continue
+        if [[ ! "$hs" =~ ^[0-9]+$ || ! "$rx" =~ ^[0-9]+$ || ! "$tx" =~ ^[0-9]+$ ]]; then
+            warn "Skipping malformed dump line for peer ${pub:0:8}..."
+            continue
+        fi
+        seen["$pub"]=1
+        name="${name_of[$pub]:-}"
+        if ((hs == 0)); then
+            age=-1 status=never
+        else
+            age=$((now - hs))
+            if ((age <= MONITOR_ACTIVE_SECS)); then status=active; else status=stale; fi
+        fi
+        if [[ -z "$name" ]]; then
+            alert high unknown-peer "Peer ${pub} (allowed-ips $allowed, endpoint $endpoint) is on $WG_INTERFACE but not in $WG_CONF"
+        fi
+
+        rrate=null trate=null
+        local prx="${prev_rx[$pub]:-}" ptx="${prev_tx[$pub]:-}"
+        if ((prev_ts > 0 && dt > 0)) && [[ "$prx" =~ ^[0-9]+$ && "$ptx" =~ ^[0-9]+$ ]]; then
+            local drx=$((rx - prx)) dtx=$((tx - ptx))
+            ((drx < 0)) && drx=$rx
+            ((dtx < 0)) && dtx=$tx
+            rrate=$((drx / dt)) trate=$((dtx / dt))
+            if ((rrate > MONITOR_SPIKE_BPS || trate > MONITOR_SPIKE_BPS)); then
+                alert medium traffic-spike "Peer ${name:-$pub}: rx $(human "$rrate")/s tx $(human "$trate")/s over ${dt}s (threshold $(human "$MONITOR_SPIKE_BPS")/s)"
+            fi
+        fi
+        sample+=("$pub"$'\t'"$rx"$'\t'"$tx")
+        jq -nc --arg name "$name" --arg pub "$pub" --arg ip "${managed_ip[$pub]:-${allowed%%/*}}" \
+            --arg endpoint "$endpoint" --arg allowed "$allowed" --arg status "$status" \
+            --argjson hs "$hs" --argjson age "$age" --argjson rx "$rx" --argjson tx "$tx" \
+            --argjson rrate "$rrate" --argjson trate "$trate" \
+            '{name: (if $name == "" then null else $name end), public_key: $pub, ip: $ip, endpoint: $endpoint,
+              allowed_ips: $allowed, managed: ($name != ""), status: $status, latest_handshake: $hs,
+              handshake_age: (if $age < 0 then null else $age end), rx_bytes: $rx, tx_bytes: $tx,
+              rx_rate: $rrate, tx_rate: $trate}' >>"$PEERS_NDJSON"
+    done <<<"$dump"
+
+    for k in "${!name_of[@]}"; do
+        [[ -n "${seen[$k]:-}" ]] && continue
+        MISSING_PEERS+=("${name_of[$k]}")
+    done
+    if ((${#MISSING_PEERS[@]})); then
+        warn "Managed peers not loaded on $WG_INTERFACE: ${MISSING_PEERS[*]} (run wg syncconf)"
     fi
-    
-    # Check system auth logs
-    local recent_failures
-    recent_failures=$(journalctl -u wg-quick@"$WG_INTERFACE" --since="5 minutes ago" | grep -c "failed\|error" || echo "0")
-    
-    if [[ $recent_failures -gt 0 ]]; then
-        alert "INFO" "WireGuard service errors in last 5 minutes: $recent_failures"
-    fi
+
+    mkdir -p "$(dirname "$MONITOR_STATE")"
+    {
+        if ((${#sample[@]})); then printf '%s\n' "${sample[@]}"; fi
+    } | jq -R 'split("\t") | {key: .[0], value: {rx: (.[1] | tonumber), tx: (.[2] | tonumber)}}' |
+        jq -s --argjson ts "$now" '{ts: $ts, peers: from_entries}' | atomic_write "$MONITOR_STATE" 600
 }
 
-# Function to check system resources
-check_system_resources() {
-    info "Checking system resources..."
-    
-    # Check CPU usage
-    local cpu_usage
-    cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    
-    if (( $(echo "$cpu_usage > 80" | bc -l) )); then
-        alert "WARNING" "High CPU usage: ${cpu_usage}%"
-    fi
-    
-    # Check memory usage
-    local mem_usage
-    mem_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}')
-    
-    if (( $(echo "$mem_usage > 85" | bc -l) )); then
-        alert "WARNING" "High memory usage: ${mem_usage}%"
-    fi
-    
-    # Check disk usage
-    local disk_usage
-    disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1)
-    
-    if [[ $disk_usage -gt 90 ]]; then
-        alert "CRITICAL" "High disk usage: ${disk_usage}%"
-    fi
-    
-    # Check network interface status
-    if ! ip link show "$WG_INTERFACE" | grep -q "UP"; then
-        alert "CRITICAL" "WireGuard interface $WG_INTERFACE is down"
-    fi
-}
+# --------------------------------------------------------------------------
+# Authelia
+# --------------------------------------------------------------------------
 
-# Function to analyze log patterns
-analyze_log_patterns() {
-    info "Analyzing log patterns..."
-    
-    local log_analysis_file="/tmp/log_analysis_$(date +%s).txt"
-    
-    # Analyze connection patterns
-    echo "=== Connection Pattern Analysis ===" > "$log_analysis_file"
-    echo "Analysis generated on: $(date)" >> "$log_analysis_file"
-    echo >> "$log_analysis_file"
-    
-    # Most active peers
-    echo "Top 10 Most Active Peers:" >> "$log_analysis_file"
-    grep "Peer:" "$LOG_FILE" | awk '{print $4}' | sort | uniq -c | sort -nr | head -10 >> "$log_analysis_file"
-    echo >> "$log_analysis_file"
-    
-    # Connection times analysis
-    echo "Connection Activity by Hour:" >> "$log_analysis_file"
-    grep "Active connections:" "$LOG_FILE" | awk '{print $2}' | cut -d':' -f1 | sort | uniq -c >> "$log_analysis_file"
-    echo >> "$log_analysis_file"
-    
-    # Alert frequency
-    echo "Alert Frequency (Last 24 Hours):" >> "$log_analysis_file"
-    grep "$(date '+%Y-%m-%d')" "$ALERT_LOG" | awk '{print $4}' | sort | uniq -c >> "$log_analysis_file"
-    echo >> "$log_analysis_file"
-    
-    # Failed authentication attempts
-    echo "Authentication Failure Patterns:" >> "$log_analysis_file"
-    grep "authentication failed" /var/log/authelia/authelia.log 2>/dev/null | \
-        awk '{print $1, $2}' | cut -d':' -f1 | sort | uniq -c | tail -20 >> "$log_analysis_file" || \
-        echo "No Authelia logs found" >> "$log_analysis_file"
-    
-    echo "Log analysis saved to: $log_analysis_file"
-    cat "$log_analysis_file"
-}
+AUTH_JSON=null
+AUTH_FAIL_RE='Unsuccessful (1FA|2FA|TOTP|WebAuthn|Duo) authentication attempt'
 
-# Function to generate monitoring report
-generate_monitoring_report() {
-    info "Generating monitoring report..."
-    
-    local report_file="/tmp/vpn_monitoring_report_$(date +%Y%m%d_%H%M%S).html"
-    
-    cat > "$report_file" << EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Zero Trust VPN Monitoring Report</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .header { background-color: #f0f0f0; padding: 10px; border-radius: 5px; }
-        .section { margin: 20px 0; }
-        .alert-critical { color: red; font-weight: bold; }
-        .alert-warning { color: orange; font-weight: bold; }
-        .alert-info { color: blue; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>Zero Trust VPN Monitoring Report</h1>
-        <p>Generated on: $(date)</p>
-        <p>Interface: $WG_INTERFACE</p>
-    </div>
-    
-    <div class="section">
-        <h2>Current Status</h2>
-        <table>
-            <tr><th>Metric</th><th>Value</th><th>Status</th></tr>
-EOF
-    
-    # Add current statistics
-    local connections
-    connections=$(wg show "$WG_INTERFACE" peers 2>/dev/null | wc -l || echo "0")
-    
-    local interface_status
-    if ip link show "$WG_INTERFACE" | grep -q "UP"; then
-        interface_status="UP"
+# Prints Authelia failure log lines from the window; returns 1 if no source.
+auth_failure_lines() {
+    local window="$1" secs="$2"
+    if [[ -n "$AUTHELIA_LOG_FILE" ]]; then
+        [[ -r "$AUTHELIA_LOG_FILE" ]] || { warn "Cannot read $AUTHELIA_LOG_FILE"; return 1; }
+        local cutoff line ts epoch
+        cutoff=$(($(date +%s) - secs))
+        grep -E "$AUTH_FAIL_RE" "$AUTHELIA_LOG_FILE" | while IFS= read -r line; do
+            if [[ "$line" =~ time[\"]?[=:][\"]?([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9:]+)?) ]]; then
+                ts="${BASH_REMATCH[1]}"
+                epoch="$(date -d "$ts" +%s 2>/dev/null)" || continue
+                ((epoch >= cutoff)) && printf '%s\n' "$line"
+            fi
+        done
+        return 0
+    fi
+    command -v docker >/dev/null 2>&1 || { warn "docker not available, cannot read Authelia logs"; return 1; }
+    local out
+    local -a cmd
+    if [[ -n "$AUTHELIA_CONTAINER" ]]; then
+        cmd=(docker logs --since "$window" "$AUTHELIA_CONTAINER")
+    elif [[ -f "$COMPOSE_FILE_PATH" ]]; then
+        cmd=(docker compose -f "$COMPOSE_FILE_PATH" --project-directory "$(dirname "$COMPOSE_FILE_PATH")"
+            logs --no-color --no-log-prefix --since "$window" "$AUTHELIA_SERVICE")
     else
-        interface_status="DOWN"
+        warn "No AUTHELIA_LOG_FILE, AUTHELIA_CONTAINER or $COMPOSE_FILE_PATH; cannot read Authelia logs"
+        return 1
     fi
-    
-    cat >> "$report_file" << EOF
-            <tr><td>Active Connections</td><td>$connections</td><td>$([ $connections -le $MAX_CONCURRENT_CONNECTIONS ] && echo "OK" || echo "HIGH")</td></tr>
-            <tr><td>Interface Status</td><td>$interface_status</td><td>$([ "$interface_status" = "UP" ] && echo "OK" || echo "ERROR")</td></tr>
-        </table>
-    </div>
-    
-    <div class="section">
-        <h2>Recent Alerts (Last 24 Hours)</h2>
-        <table>
-            <tr><th>Time</th><th>Severity</th><th>Message</th></tr>
-EOF
-    
-    # Add recent alerts
-    grep "$(date '+%Y-%m-%d')" "$ALERT_LOG" 2>/dev/null | tail -20 | while IFS= read -r line; do
-        local timestamp severity message
-        timestamp=$(echo "$line" | awk '{print $1, $2}')
-        severity=$(echo "$line" | awk '{print $4}' | tr -d '[]')
-        message=$(echo "$line" | cut -d']' -f2- | xargs)
-        
-        local css_class
-        case "$severity" in
-            "CRITICAL") css_class="alert-critical" ;;
-            "WARNING") css_class="alert-warning" ;;
-            *) css_class="alert-info" ;;
-        esac
-        
-        echo "<tr><td>$timestamp</td><td class=\"$css_class\">$severity</td><td>$message</td></tr>" >> "$report_file"
-    done || echo "<tr><td colspan=\"3\">No alerts in the last 24 hours</td></tr>" >> "$report_file"
-    
-    cat >> "$report_file" << EOF
-        </table>
-    </div>
-    
-    <div class="section">
-        <h2>System Resources</h2>
-        <table>
-            <tr><th>Resource</th><th>Usage</th><th>Status</th></tr>
-EOF
-    
-    # Add system resource information
-    local cpu_usage mem_usage disk_usage
-    cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    mem_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}')
-    disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1)
-    
-    cat >> "$report_file" << EOF
-            <tr><td>CPU</td><td>${cpu_usage}%</td><td>$([ $(echo "$cpu_usage < 80" | bc -l) -eq 1 ] && echo "OK" || echo "HIGH")</td></tr>
-            <tr><td>Memory</td><td>${mem_usage}%</td><td>$([ $(echo "$mem_usage < 85" | bc -l) -eq 1 ] && echo "OK" || echo "HIGH")</td></tr>
-            <tr><td>Disk</td><td>${disk_usage}%</td><td>$([ $disk_usage -lt 90 ] && echo "OK" || echo "HIGH")</td></tr>
-        </table>
-    </div>
-    
-</body>
-</html>
-EOF
-    
-    echo "Monitoring report generated: $report_file"
-    
-    # Send report via email if configured
-    if [[ "${EMAIL_ALERTS:-false}" == "true" && -n "${ADMIN_EMAIL:-}" ]]; then
-        send_email_report "$report_file"
-    fi
+    out="$("${cmd[@]}" 2>&1)" || {
+        warn "${cmd[*]} failed: ${out:0:200}"
+        return 1
+    }
+    grep -E "$AUTH_FAIL_RE" <<<"$out" || true
 }
 
-# Function to send notifications
-send_notification() {
-    local title="$1"
-    local message="$2"
-    local priority="$3"
-    
-    # Webhook notification
-    if [[ -n "${WEBHOOK_URL:-}" ]]; then
-        curl -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"title\":\"$title\",\"message\":\"$message\",\"priority\":\"$priority\",\"timestamp\":\"$(date -Iseconds)\"}" \
-            >/dev/null 2>&1 || true
+collect_auth() {
+    local window="$1" secs="$2" lines f1 f2
+    if ! lines="$(auth_failure_lines "$window" "$secs")"; then
+        AUTH_JSON=null
+        return 0
     fi
-    
-    # Slack notification
-    if [[ -n "${SLACK_WEBHOOK:-}" ]]; then
-        curl -X POST "$SLACK_WEBHOOK" \
-            -H "Content-Type: application/json" \
-            -d "{\"text\":\"$title\\n$message\"}" \
-            >/dev/null 2>&1 || true
-    fi
-    
-    # Email notification for critical alerts
-    if [[ "$priority" == "high" && "${EMAIL_ALERTS:-false}" == "true" ]]; then
-        send_email_alert "$title" "$message"
-    fi
-}
+    f1="$(grep -c 'Unsuccessful 1FA authentication attempt' <<<"$lines" || true)"
+    f2="$(grep -cE 'Unsuccessful (2FA|TOTP|WebAuthn|Duo) authentication attempt' <<<"$lines" || true)"
+    local -A by_ip=()
+    local line ipaddr count
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" =~ remote_ip[\"]?[=:][\"]?([0-9A-Fa-f.:]+) ]]; then
+            ipaddr="${BASH_REMATCH[1]}"
+            count="${by_ip[$ipaddr]:-0}"
+            by_ip["$ipaddr"]=$((count + 1))
+        fi
+    done <<<"$lines"
 
-# Function to send email alerts
-send_email_alert() {
-    local subject="$1"
-    local body="$2"
-    
-    if command -v mail >/dev/null 2>&1 && [[ -n "${ADMIN_EMAIL:-}" ]]; then
-        echo "$body" | mail -s "$subject" "${ADMIN_EMAIL}"
+    local by_ip_json='{}' k
+    if ((${#by_ip[@]})); then
+        by_ip_json="$(for k in "${!by_ip[@]}"; do printf '%s\t%s\n' "$k" "${by_ip[$k]}"; done |
+            jq -R 'split("\t") | {key: .[0], value: (.[1] | tonumber)}' | jq -sc from_entries)"
     fi
-}
+    AUTH_JSON="$(jq -nc --arg src "${AUTHELIA_LOG_FILE:-docker:${AUTHELIA_CONTAINER:-compose/$AUTHELIA_SERVICE}}" --arg window "$window" \
+        --argjson f1 "$f1" --argjson f2 "$f2" --argjson by_ip "$by_ip_json" \
+        '{source: $src, window: $window, failed_1fa: $f1, failed_2fa: $f2, by_ip: $by_ip}')"
 
-# Function to test alert system
-test_alert_system() {
-    info "Testing alert system..."
-    
-    alert "INFO" "Test info alert - monitoring system is working"
-    alert "WARNING" "Test warning alert - this is a test"
-    alert "CRITICAL" "Test critical alert - this is a test"
-    
-    success "Alert system test completed"
-}
-
-# Function for continuous monitoring
-continuous_monitoring() {
-    info "Starting continuous monitoring mode..."
-    
-    while true; do
-        echo "=== Monitoring Check: $(date) ==="
-        
-        # Load current configuration
-        load_config
-        
-        # Perform monitoring checks
-        monitor_connections "$WG_INTERFACE"
-        monitor_auth_logs
-        check_system_resources
-        
-        echo "=== Check Complete ==="
-        echo
-        
-        # Wait for next check
-        sleep "${CHECK_INTERVAL:-60}"
+    for k in "${!by_ip[@]}"; do
+        count="${by_ip[$k]}"
+        ((count >= MONITOR_AUTH_FAIL_THRESHOLD)) || continue
+        alert high auth-failures "$count failed Authelia logins from $k within $window"
+        if ((RESPOND)); then
+            if validate_ipv4 "$k" || [[ "$k" == *:* ]]; then
+                if "$THREAT_RESPONSE" --type brute-force --ip "$k" --duration "$MONITOR_BLOCK_DURATION" \
+                    --reason "connection-monitor: $count failed logins" >/dev/null; then
+                    info "Handed $k to threat-response (blocked for $MONITOR_BLOCK_DURATION)"
+                else
+                    error "threat-response did not block $k"
+                fi
+            fi
+        fi
     done
 }
 
-# Main execution
-main() {
-    echo "Zero Trust VPN - Connection Monitor"
-    echo "=================================="
-    echo
-    
-    # Load configuration
-    load_config
-    
-    # Handle different modes
-    if [[ "$TEST_ALERTS" == "true" ]]; then
-        test_alert_system
-        return
+# --------------------------------------------------------------------------
+
+RESPOND=0
+MISSING_PEERS=()
+
+run_once() {
+    local window="$1" json="$2" secs
+    secs="$(window_seconds "$window")"
+    ALERTS=()
+    MISSING_PEERS=()
+    AUTH_JSON=null
+    collect_wireguard
+    collect_auth "$window" "$secs"
+
+    local alerts_json='[]' missing_json='[]'
+    if ((${#ALERTS[@]})); then
+        alerts_json="$(printf '%s\n' "${ALERTS[@]}" | jq -R 'split("\t") | {severity: .[0], source: .[1], message: .[2]}' | jq -sc .)"
     fi
-    
-    if [[ "$ANALYZE_LOGS" == "true" ]]; then
-        analyze_log_patterns
-        return
+    if ((${#MISSING_PEERS[@]})); then
+        missing_json="$(printf '%s\n' "${MISSING_PEERS[@]}" | jq -R . | jq -sc .)"
     fi
-    
-    if [[ "$GENERATE_REPORT" == "true" ]]; then
-        generate_monitoring_report
-        return
+
+    if ((json)); then
+        jq -s --arg iface "$WG_INTERFACE" --arg at "$(date -u +%FT%TZ)" --argjson auth "$AUTH_JSON" \
+            --argjson alerts "$alerts_json" --argjson missing "$missing_json" \
+            '{generated: $at, interface: $iface, peers: ., unknown_peers: (map(select(.managed | not)) | length),
+              managed_peers_not_loaded: $missing, auth: $auth, alerts: $alerts}' "$PEERS_NDJSON"
+    else
+        printf '%-28s %-15s %-10s %10s %12s %12s\n' PEER IP STATUS HANDSHAKE RX TX
+        local name ip status age rx tx
+        while IFS=$'\t' read -r name ip status age rx tx; do
+            [[ "$age" == null ]] && age=never || age="${age}s"
+            printf '%-28s %-15s %-10s %10s %12s %12s\n' "$name" "$ip" "$status" "$age" "$(human "$rx")" "$(human "$tx")"
+        done < <(jq -r '[(.name // "UNKNOWN(\(.public_key[0:8]))"), .ip, .status, (.handshake_age // "null" | tostring), .rx_bytes, .tx_bytes] | @tsv' "$PEERS_NDJSON")
+        if ((${#MISSING_PEERS[@]})); then
+            printf 'Managed peers not loaded on %s: %s\n' "$WG_INTERFACE" "${MISSING_PEERS[*]}"
+        fi
+        if [[ "$AUTH_JSON" == null ]]; then
+            printf 'Failed logins: unavailable (no Authelia log source)\n'
+        else
+            jq -r '"Failed logins in last \(.window): 1FA=\(.failed_1fa) 2FA=\(.failed_2fa)"' <<<"$AUTH_JSON"
+        fi
+        printf 'Alerts: %d\n' "${#ALERTS[@]}"
     fi
-    
-    if [[ "$CONTINUOUS" == "true" ]]; then
-        continuous_monitoring
-        return
-    fi
-    
-    # Single monitoring check
-    log "Starting monitoring check"
-    monitor_connections "$WG_INTERFACE"
-    monitor_auth_logs
-    check_system_resources
-    log "Monitoring check completed"
+    ((${#ALERTS[@]} == 0))
 }
 
-# Run main function
+main() {
+    local watch=0 window="" json=0
+    while (($#)); do
+        case "$1" in
+            --once) watch=0; shift ;;
+            --watch) watch="${2:-}"; shift 2 || fatal "--watch needs a value" ;;
+            --window) window="${2:-}"; shift 2 || fatal "--window needs a value" ;;
+            --json) json=1; shift ;;
+            --respond) RESPOND=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) usage >&2; fatal "Unknown option: $1" ;;
+        esac
+    done
+    [[ "$watch" =~ ^[0-9]{1,5}$ ]] || fatal "Invalid --watch interval"
+    if [[ -z "$window" ]]; then
+        if ((watch > 0)); then window="${watch}s"; else window=10m; fi
+    fi
+    window_seconds "$window" >/dev/null || fatal "Invalid --window: $window"
+    local v
+    for v in MONITOR_ACTIVE_SECS MONITOR_SPIKE_BPS MONITOR_AUTH_FAIL_THRESHOLD; do
+        [[ "${!v}" =~ ^[0-9]+$ ]] || fatal "Invalid $v"
+    done
+    [[ -z "$AUTHELIA_CONTAINER" || "$AUTHELIA_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fatal "Invalid AUTHELIA_CONTAINER"
+    [[ "$AUTHELIA_SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fatal "Invalid AUTHELIA_SERVICE"
+    require_cmd wg jq
+
+    local work
+    work="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+    PEERS_NDJSON="$work/peers.ndjson"
+
+    if ((watch == 0)); then
+        run_once "$window" "$json" || exit 1
+        exit 0
+    fi
+    while :; do
+        run_once "$window" "$json" || true
+        sleep "$watch"
+    done
+}
+
 main "$@"
