@@ -190,10 +190,15 @@ block_ip() {
     set="$(nft_set_for "$ip")"
     nft add element inet "$NFT_TABLE" "$set" "{ $ip timeout $dur }" || return 1
     # Established flows are accepted before the blocklist; drop them too.
+    # Without conntrack they keep flowing (e.g. an active WireGuard session
+    # or HTTP keep-alive stays up for as long as it has traffic).
     if command -v conntrack >/dev/null 2>&1; then
         conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        echo "added to $set, expires after $dur, established connections flushed"
+    else
+        warn "conntrack not installed: established connections from $ip are NOT cut (install the conntrack package)"
+        echo "added to $set, expires after $dur; established connections NOT flushed (conntrack missing)"
     fi
-    echo "added to $set, expires after $dur"
 }
 
 unblock_ip() {
