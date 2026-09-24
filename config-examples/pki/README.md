@@ -18,6 +18,8 @@ settings in `/etc/zero-trust-vpn/ztvpn.conf`:
 | `PKI_KEY_ALG`     | `ec:prime256v1`  | server/client keys                       |
 | `PKI_CRL_URL`     | empty            | CRL distribution point embedded in certs |
 | `PKI_SERVER_SANS` | empty            | extra SANs for the server certificate    |
+| `PKI_CRL_RENEW_DAYS` | `7`           | `cert-renewal.sh` regenerates the CRL below this |
+| `PKI_P12_COMPAT`  | `no`             | `yes`: 3DES/SHA1 `.p12` for old clients  |
 
 To change it, edit `ztvpn.conf` and run
 `scripts/setup/pki-setup.sh --write-config`. To see the result:
@@ -38,4 +40,6 @@ What the generated configuration contains:
 
 Layout under `$PKI_DIR`: `ca/ca.crt`, `ca/private/ca.key` (AES-256, passphrase
 in `/etc/zero-trust-vpn/secrets/ca.pass`), `server/<name>.{key,crt}`,
-`clients/<name>.{key,crt}`, `crl/ca.crl`.
+`clients/<name>.{key,crt,p12}`, `crl/ca.crl` (valid 30 days, always replaced
+by rename because nginx caches CRLs by inode; with `MTLS=yes` nginx enforces
+it, see `docs/operations.md`).

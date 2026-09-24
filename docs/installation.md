@@ -73,6 +73,8 @@ it. Environment variables override values in the file.
 | `PKI_ORG`, `PKI_COUNTRY`, `PKI_CERT_DAYS`, `PKI_CA_DAYS`, `PKI_KEY_ALG`, `PKI_CA_KEY_ALG`, `PKI_CRL_URL`, `PKI_RENEW_DAYS` | see example | CA and certificate parameters (`config-examples/pki/README.md`) |
 | `AUTHELIA_BACKEND` | `file` | `file` or `ldap` |
 | `DEFAULT_USER_GROUPS` | `users,vpn-users` | Groups every new user gets |
+| `MTLS` | `no` | `yes` = the proxy requires a non-revoked client certificate from this CA (see operations, "Client certificates and mTLS") |
+| `PKI_CRL_RENEW_DAYS` / `PKI_P12_COMPAT` | `7` / `no` | CRL renewal threshold; legacy-compatible `.p12` encryption |
 | `LDAP_DISABLE_HOOK` | empty | LDAP only: executable called as `<hook> <user> disable\|delete` by `revoke-user.sh` |
 | `ADMIN_EMAIL` | empty | E-mail of the first Authelia admin (default `admin@<DOMAIN>`) |
 | `TZ` | `UTC` | Time zone for the containers |

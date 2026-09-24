@@ -96,9 +96,10 @@ Read these before relying on the setup.
   (`security-audit.sh` reports this as `FILE-WG-CLIENT-KEYS-ON-SERVER`).
 - **No device posture.** Nothing checks OS version, disk encryption, EDR or
   anything else about the client device.
-- **X.509 client certificates are not enforced.** `--cert` issues them and
-  revocation puts them on the CRL, but the shipped nginx templates do not
-  use `ssl_verify_client`. Enabling mTLS is up to you.
+- **Client certificates are enforced only with `MTLS=yes`** (default `no`).
+  Then every HTTPS request to the proxy needs a non-revoked certificate
+  from this CA, but the certificate is not tied to the Authelia user: any
+  valid device certificate plus any valid login gets in.
 - **Per-user authorization exists only at the HTTP layer.** The firewall
   treats all peers the same: every peer can reach
   `SERVICES_SUBNET:SERVICES_PORTS`. Adding a port there that is not behind
@@ -210,7 +211,7 @@ Details and examples: [docs/operations.md](docs/operations.md).
 | `scripts/management/user-account.sh` | `reset-password`, `enable`, `disable`, `show` for Authelia file-backend accounts. |
 | `scripts/management/device-enrollment.sh` | `enroll`, `remove`, `list`, `show` additional devices (`<user>--<device>` peers). |
 | `scripts/management/policy-update.sh` | Access-control rules and group membership in the live Authelia config, validated with rollback; backup/restore. |
-| `scripts/automation/cert-renewal.sh` | `check` expiry (exit 0/1/2), `renew` server certificates and reload nginx. |
+| `scripts/automation/cert-renewal.sh` | `check` expiry of certificates and CRL (exit 0/1/2), `renew` server certificates and the CRL, `crl` regenerates the CRL; reloads nginx. |
 | `scripts/automation/threat-response.sh` | Block IPs with expiring nftables set entries, quarantine peers, contain compromised devices/users; `unblock`, `release`. |
 | `scripts/automation/user-sync.sh` | Revokes VPN access of users missing, disabled or not in the required group in LDAP/AD. Dry run unless `--apply`. |
 | `scripts/monitoring/connection-monitor.sh` | Peer handshakes and transfer, unknown peers, traffic spikes, failed Authelia logins; `--respond` blocks brute force. |

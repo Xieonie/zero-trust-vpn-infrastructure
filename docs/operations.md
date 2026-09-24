@@ -179,6 +179,29 @@ scripts/management/policy-update.sh backup
 scripts/management/policy-update.sh restore 20260101T120000.123456789 --restart
 ```
 
+## Client certificates and mTLS
+
+`add-user.sh --cert` and `device-enrollment.sh enroll --cert` issue a client
+certificate (`CN=<peer>`) and a PKCS#12 bundle
+`/opt/zero-trust-vpn/certificates/clients/<peer>.p12` (with the CA cert).
+Its password is written only to the 0600 onboarding file. Set
+`PKI_P12_COMPAT=yes` for older macOS/iOS/Android that cannot import
+AES-encrypted bundles.
+
+With `MTLS=yes` in `ztvpn.conf` (then re-run `initial-setup.sh`):
+
+- every HTTPS server of the proxy requires a client certificate from this CA
+  that is not on the CRL (`/etc/nginx/snippets/mtls.conf`, regenerated on
+  every run); without one the browser gets a 403 page explaining why;
+- TLS session resumption is off, so a revoked certificate cannot resume an
+  older session;
+- every CRL change (`revoke-user.sh`, `device-enrollment.sh remove`,
+  `threat-response.sh`, `cert-renewal.sh`) reloads nginx;
+- users import the `.p12` into their browser/OS before logging in.
+
+The certificate proves the device holds a key issued by this CA. It is not
+matched against the Authelia user.
+
 ## Certificates
 
 ```sh
@@ -197,6 +220,11 @@ scripts/automation/cert-renewal.sh renew --days 30
   nginx container (`--no-reload` to skip). Client certificates are only
   re-issued with `--reissue-clients`; their new private key is created on
   the server.
+- `check` also reports the CRL (warning below `--crl-days`, default
+  `PKI_CRL_RENEW_DAYS=7`; critical below 2 days or expired). `renew`
+  regenerates the CRL when it is due, `crl` regenerates it unconditionally.
+  The CRL is valid for 30 days; with `MTLS=yes` nginx rejects everyone once
+  it expires, so schedule `renew` daily (see Scheduling).
 - The CA is only reported (warning within 180 days). It is never renewed
   automatically.
 

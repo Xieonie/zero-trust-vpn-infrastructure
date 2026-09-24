@@ -58,7 +58,7 @@ Options:
   --dry-run           Show what renew would do, change nothing
   --reissue-clients   Also reissue expiring client certificates. The new private key is
                       generated here and stays in $PKI_CLIENTS_DIR until you hand it to
-                      the user; prefer having users submit a CSR instead.
+                      the user; deliver it like the onboarding .p12.
   --no-reload         Do not signal the TLS terminator after renewing
   -h, --help          Show this help
 
