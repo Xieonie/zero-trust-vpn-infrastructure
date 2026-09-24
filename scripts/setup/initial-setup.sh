@@ -122,12 +122,14 @@ check_settings() {
     validate_hostname "$AUTH_DOMAIN" || die "Invalid AUTH_DOMAIN: $AUTH_DOMAIN"
     validate_hostname "$VPN_ENDPOINT" || validate_ipv4 "$VPN_ENDPOINT" || die "Invalid VPN_ENDPOINT: $VPN_ENDPOINT"
     local v example=""
-    for v in "$DOMAIN" "$AUTH_DOMAIN" "$VPN_ENDPOINT"; do
+    local -a sans=()
+    mapfile -t sans < <(split_csv "${PKI_SERVER_SANS:-}")
+    for v in "$DOMAIN" "$AUTH_DOMAIN" "$VPN_ENDPOINT" "${sans[@]}"; do
         [[ "$v" == example.com || "$v" == *.example.com ]] && example="$v"
     done
     if [[ -n "$example" ]]; then
         if ((NON_INTERACTIVE)) || [[ ! -t 0 ]]; then
-            die "$example is a placeholder. Edit $ZTVPN_CONFIG (DOMAIN, AUTH_DOMAIN, VPN_ENDPOINT) and run again."
+            die "$example is a placeholder. Edit $ZTVPN_CONFIG (DOMAIN, AUTH_DOMAIN, VPN_ENDPOINT, PKI_SERVER_SANS) and run again."
         fi
         local answer=""
         read -r -p "$example is a placeholder. Continue with the example values (test install only)? [y/N] " answer
